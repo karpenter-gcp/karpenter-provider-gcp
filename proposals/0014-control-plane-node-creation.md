@@ -141,7 +141,7 @@ The `Node` must equal what the kubelet would have registered and must not requir
 
 #### 7. Kubernetes version guard
 
-Revisit `MaxK8sVersion` (currently `1.36.99`, logging an ERROR on 1.37) once the e2e suites pass on 1.37.
+`MaxK8sVersion` was `1.36.99`, which logged an ERROR on every 1.37 cluster at startup. This PR raises it to `1.37.99`: Karpenter was run on 1.37.1-gke.2097000 in `VIA_KUBELET` mode and provisioned, registered and ran workloads, and the shared e2e cluster moves to 1.37 with this PR. The full suites have not yet run on 1.37; that run is the first validation after the Terraform is applied.
 
 #### 8. E2E and infrastructure prerequisites
 

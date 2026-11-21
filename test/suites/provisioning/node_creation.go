@@ -35,7 +35,7 @@ import (
 // These specs cover how a Karpenter node becomes a Node object. GKE creates the
 // Node either from the kubelet (VIA_KUBELET) or, with control plane node creation,
 // from gcp-controller-manager (VIA_CONTROL_PLANE); see
-// proposals/0014-control-plane-node-creation.md. Each registration spec skips itself
+// proposals/0016-control-plane-node-creation.md. Each registration spec skips itself
 // unless the cluster is in the mode it covers, so a run exercises exactly the
 // specs for its cluster and the report shows the other mode's spec as skipped.
 var _ = Describe("Node creation mode", Label("suite:provisioning"), func() {

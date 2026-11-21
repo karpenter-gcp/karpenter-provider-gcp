@@ -54,7 +54,7 @@ Observed contract gap: new 1.37.2-gke.1606000 clusters created via gcloud and vi
 
 - Reproducing or replacing `gcp-controller-manager` logic beyond what registration needs.
 - Autopilot, non-GKE (self-hosted) provisioning, Windows nodes.
-- Changing CSR authorization policy; that is the scope of proposal 0012 / #778. This proposal only consumes its outcome.
+- Changing CSR authorization policy; that is the scope of the CSR attestation proposal in #795 / #778. This proposal only consumes its outcome.
 - Making the provider create `Node` objects in `VIA_KUBELET` mode by default (see Alternatives).
 
 ---
@@ -96,7 +96,7 @@ The reported mode lags a flip: during a `KUBELET` to `CONTROL_PLANE` update `clu
 
 #### 3. Enrollment evidence and the controller `pkg/controllers/nodecreation`
 
-**Enrollment record.** The CSR controller (`pkg/controllers/csr`) already decides whether a kubelet client CSR belongs to a launched, unregistered, provider-owned NodeClaim. After a successful approval it also records the fact on that NodeClaim (annotation `karpenter.k8s.gcp/kubelet-enrolled-at: <RFC3339>`, written once with `NodeClaim` patch rights the controller already has). The new controller consumes this record instead of re-parsing CSRs or matching the approval reason string, and it does not depend on CSR objects surviving garbage collection. The CSR controller is also changed by proposal 0012 (#795); ownership of that code stays with the CSR controller, so whatever verification 0012 adds gates the annotation automatically.
+**Enrollment record.** The CSR controller (`pkg/controllers/csr`) already decides whether a kubelet client CSR belongs to a launched, unregistered, provider-owned NodeClaim. After a successful approval it also records the fact on that NodeClaim (annotation `karpenter.k8s.gcp/kubelet-enrolled-at: <RFC3339>`, written once with `NodeClaim` patch rights the controller already has). The new controller consumes this record instead of re-parsing CSRs or matching the approval reason string, and it does not depend on CSR objects surviving garbage collection. The CSR controller is also changed by the CSR attestation work in #795; ownership of that code stays with the CSR controller, so whatever verification the #795 work adds gates the annotation automatically.
 
 **Controller.** Follows the pattern of the CSR controller (operator cached client, event-driven on NodeClaim and Node, `RequeueAfter` for the grace period). For each NodeClaim, act only when **all** hold:
 
@@ -223,7 +223,7 @@ This is what was done by hand, with a `gcloud` flip, for the evidence in this pr
 | Controller privilege increase (`nodes: create`)                                                                                                                                                                          | Low           | Medium                       | Narrow create path (enrolled, launched, provider-owned claims only), negative e2e test, security docs                                                                                                                                      |
 | Label trust: controller-created Node bypasses `NodeRestriction`                                                                                                                                                          | Low           | Medium                       | Keys only from the provider-written `kube-labels` item, kubelet-equivalent filter for `kubernetes.io`/`k8s.io` keys, same metadata trust boundary as today                                                                                 |
 | Orphan or duplicate Node (claim deleted mid-creation, recycled name, stale Node with the same providerID)                                                                                                                | Low           | Medium                       | Re-read claim before create, `NodeForNodeClaim` providerID check before create, no finalizers or owner refs until core registers, CCM lifecycle controller as safety net, tests for each case                                              |
-| Overlap with proposal 0012 CSR changes                                                                                                                                                                                   | Medium        | Low                          | The CSR controller owns and writes the enrollment annotation; this proposal never re-implements CSR authorization                                                                                                                          |
+| Overlap with the CSR attestation changes (#795)                                                                                                                                                                          | Medium        | Low                          | The CSR controller owns and writes the enrollment annotation; this proposal never re-implements CSR authorization                                                                                                                          |
 
 ---
 

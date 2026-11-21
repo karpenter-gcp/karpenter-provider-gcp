@@ -38,7 +38,7 @@ import (
 
 const (
 	// NodeCreatedByAnnotation marks a Node created by the provider's node creation
-	// controller (proposals/0014-control-plane-node-creation.md). It is absent on
+	// controller (proposals/0016-control-plane-node-creation.md). It is absent on
 	// Nodes the kubelet or GKE's control plane created.
 	NodeCreatedByAnnotation = "karpenter.k8s.gcp/created-by"
 	// NodeCreatedByController is the NodeCreatedByAnnotation value for that controller.

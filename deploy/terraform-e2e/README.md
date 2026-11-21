@@ -42,7 +42,7 @@ terraform import 'module.cluster.google_project_iam_custom_role.karpenter_contro
 A profile is a second environment in the same project with its own prefix, state and cluster, selected by layering a
 committed variable file over `terraform.tfvars`. `profiles/control-plane.tfvars` creates `karpenter-e2e-cp`
 with `node_creation_mode = "VIA_CONTROL_PLANE"`. It exists because GKE is moving to control plane node creation
-(see `proposals/0014-control-plane-node-creation.md`) while the provider cannot yet register nodes in that mode, so
+(see `proposals/0016-control-plane-node-creation.md`) while the provider cannot yet register nodes in that mode, so
 the shared `karpenter-e2e` cluster stays `VIA_KUBELET`. The profile has the same region, zones, release channel and
 Kubernetes floor as the shared cluster, its own VPC (so CIDRs may repeat), registry, service accounts, tag key and
 controller role, and about the cost of a second regional control plane plus one system node.

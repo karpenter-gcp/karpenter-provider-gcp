@@ -54,14 +54,14 @@ variable "system_node_locations" {
 
 variable "prefix" {
   type        = string
-  description = "Resource name prefix. Use a name unique to your project unless you are the shared target."
+  description = "Resource name prefix. Use a name unique to your project unless you are the shared target or one of its committed profiles (profiles/)."
   validation {
     condition     = can(regex("^[a-z][a-z0-9-]{0,19}$", var.prefix))
     error_message = "Use a lowercase resource prefix starting with a letter and no longer than 20 characters."
   }
   validation {
-    condition     = var.project_id != "planetscale-karp-gcp-e2e" || var.prefix == "karpenter-e2e"
-    error_message = "The sponsored project is reserved for the shared karpenter-e2e target; run a private environment in your own project."
+    condition     = var.project_id != "planetscale-karp-gcp-e2e" || contains(["karpenter-e2e", "karpenter-e2e-cp"], var.prefix)
+    error_message = "The sponsored project is reserved for the shared karpenter-e2e target and its control-plane profile karpenter-e2e-cp; run any other environment in your own project."
   }
 }
 
@@ -108,6 +108,22 @@ variable "release_channel" {
   validation {
     condition     = contains(["STABLE", "REGULAR", "RAPID", "EXTENDED"], var.release_channel)
     error_message = "Select STABLE, REGULAR, RAPID or EXTENDED."
+  }
+}
+
+variable "min_master_version" {
+  type        = string
+  default     = null
+  description = "Minimum Kubernetes control plane version for the e2e cluster, for example \"1.37\". The release channel must offer it."
+}
+
+variable "node_creation_mode" {
+  type        = string
+  default     = null
+  description = "VIA_KUBELET or VIA_CONTROL_PLANE; null leaves the mode to GKE. The e2e environment pins it so a change of the GKE default cannot silently change what is tested."
+  validation {
+    condition     = var.node_creation_mode == null ? true : contains(["VIA_KUBELET", "VIA_CONTROL_PLANE"], var.node_creation_mode)
+    error_message = "Select VIA_KUBELET or VIA_CONTROL_PLANE."
   }
 }
 

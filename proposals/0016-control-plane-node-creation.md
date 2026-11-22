@@ -19,7 +19,7 @@ This proposal makes the provider work in both modes. The provider detects the mo
 
 ### Problem Statement
 
-GKE release notes (2026-09-04) state that clusters created on 1.37.0-gke.2100000 and later default to control plane node creation; the mode has been available since 1.35.3-gke.1189000. In this mode `gcp-controller-manager` creates the `Node` after the kubelet's client CSR is approved, and an admission controller rejects kubelet `Node` creation.
+The [GKE release notes of 2026-09-04, "Other changes in 1.37"](https://docs.cloud.google.com/kubernetes-engine/docs/release-notes#other_changes_in_137) state that clusters created on 1.37.0-gke.2100000 and later default to control plane node creation; the mode has been available since 1.35.3-gke.1189000 (see [Control plane node creation](https://docs.cloud.google.com/kubernetes-engine/security/control-plane-node-creation), which still labels it Preview and describes opting out with `--node-creation-mode=KUBELET`). In this mode `gcp-controller-manager` creates the `Node` after the kubelet's client CSR is approved, and an admission controller rejects kubelet `Node` creation.
 
 Evidence from a temporary cluster (GKE 1.37.1-gke.2097000, RAPID channel, Shielded nodes, Dataplane V2), 2026-11-21:
 

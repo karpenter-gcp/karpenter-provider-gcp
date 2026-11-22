@@ -147,10 +147,10 @@ The `Node` must equal what the kubelet would have registered and must not requir
 
 Delivered with this proposal so the fix can be validated on a 1.37 cluster:
 
-- `deploy/terraform` gains `min_master_version` (optional, validated, passed to `google_container_cluster.min_master_version`). It is a floor; GKE keeps auto-upgrading inside the release channel, which must offer the version. The e2e root passes it through and the shared `terraform.tfvars` sets `release_channel = "REGULAR"` and `min_master_version = "1.37"` because `STABLE` does not yet offer 1.37. The module also gains `node_creation_mode` (`VIA_KUBELET` or `VIA_CONTROL_PLANE`, rendered as `node_creation_config`), the `google` provider moves from 6.28.0 to 7.46.2 (the field needs 7.36.0 or later), and the shared e2e config pins `VIA_KUBELET` explicitly. A read-only `terraform plan` (no lock, nothing applied) against the shared state shows exactly two in-place cluster changes and nothing else: `min_master_version` set to `1.37` and `release_channel` `STABLE` to `REGULAR`, so the provider bump itself causes no drift and the pinned mode matches the current one. Applying it is a separate, explicitly approved live operation that upgrades the control plane. A `control-plane` profile (`karpenter-e2e-cp`, own state) is committed for the `VIA_CONTROL_PLANE` runs; see section 9.
+- `deploy/terraform` gains `min_master_version` (optional, validated, passed to `google_container_cluster.min_master_version`). It is a floor; GKE keeps auto-upgrading inside the release channel, which must offer the version. The e2e root passes it through and the shared `terraform.tfvars` sets `release_channel = "REGULAR"` and `min_master_version = "1.37"` because `STABLE` does not yet offer 1.37. The module also gains `node_creation_mode` (`VIA_KUBELET` or `VIA_CONTROL_PLANE`, rendered as `node_creation_config`), the `google` provider moves from 6.28.0 to 7.46.2 (the field needs 7.36.0 or later), and the shared e2e config pins `VIA_KUBELET` explicitly. A read-only `terraform plan` (no lock, nothing applied) against the shared state shows exactly two in-place cluster changes and nothing else: `min_master_version` set to `1.37` and `release_channel` `STABLE` to `REGULAR`, so the provider bump itself causes no drift and the pinned mode matches the current one. Applying it is a separate, explicitly approved live operation that upgrades the control plane. Switching the shared cluster to `VIA_CONTROL_PLANE` is a deliberate later change of `node_creation_mode` by the environment owner; see section 9.
 - The channel image-selection spec skips itself when the selected channel offers no version for the cluster's Kubernetes minor. `ResolveVersionForChannel` exposes `ErrNoVersionForClusterMinor`; the e2e helper `SkipIfChannelLacksClusterMinor` skips only on that error, so other resolution failures still fail the spec.
 
-The control-plane enrolment profile and its specs are designed in section 9.
+The control-plane validation run and its specs are designed in section 9.
 
 #### 9. E2E validation design
 
@@ -158,38 +158,25 @@ The control-plane enrolment profile and its specs are designed in section 9.
 
 **Principles.**
 
-- Pin the mode explicitly in every e2e profile. A profile that relies on the GKE default changes behavior silently the day the default flips, including when a cluster is recreated.
-- Use the existing tooling unchanged where possible. `make e2e-deploy`, `e2e-tests`, `e2e-clean-env` and the runner already derive every name (cluster, pod ranges, tag key, registry, service accounts) from `E2E_PREFIX`, so a second environment is a second prefix, not new scripts.
-- Show red before green: the profile is built first and run against current `main` to demonstrate that the specs detect the bug, then against the fix.
+- Pin the mode explicitly in the e2e Terraform. A cluster that relies on the GKE default changes behavior silently the day the default flips, including when it is recreated. The shared config pins `VIA_KUBELET` in this PR.
+- Use the existing tooling unchanged. `make e2e-deploy`, `e2e-tests` and the runner already target one cluster and derive every name from `E2E_PREFIX`.
+- Show red before green: run the specs against current `main` on a `VIA_CONTROL_PLANE` cluster to demonstrate that they detect the bug, then against the fix.
 
-**Profiles.**
+**Environment.** The validation uses the shared persistent cluster. The environment owner switches it by changing `node_creation_mode` in `deploy/terraform-e2e/terraform.tfvars` when ready to test and applying it (an explicitly approved live operation, together with the channel and 1.37 floor changes in this PR). The change affects only nodes created afterwards, and `clusters.get` keeps reporting the old mode until the cluster operation finishes, so confirm the mode after the cluster returns to `RUNNING`; the new specs enforce that. While the cluster is in `VIA_CONTROL_PLANE`, current `main` cannot register nodes, so other branches' runs are red until the provider fix lands or the owner switches back; timing the switch is the owner's call. No second cluster, state, or Terraform guard change is part of this proposal.
 
-| Profile                                | Prefix             | Mode                        | State                                                |
-|----------------------------------------|--------------------|-----------------------------|------------------------------------------------------|
-| shared (existing cluster)              | `karpenter-e2e`    | `VIA_KUBELET`, pinned       | persistent                                           |
-| `control-plane` (committed in this PR) | `karpenter-e2e-cp` | `VIA_CONTROL_PLANE`, pinned | created per validation (tier 1), or persistent later |
+**Infrastructure changes (`deploy/terraform`, `deploy/terraform-e2e`), done in this PR.** `node_creation_mode` input on the cluster module and the e2e root, `google` provider 7.46.2 (the field needs 7.36.0 or later), the shared config pinned to `VIA_KUBELET`, verified by the read-only plan described in section 8.
 
-The shared cluster stays `VIA_KUBELET` until the provider supports the other mode, so unrelated branches keep a green environment while the fix is built and validated. `profiles/control-plane.tfvars` and its backend config (own state prefix) are committed; the e2e Terraform prefix guard allows exactly `karpenter-e2e` and `karpenter-e2e-cp` in the sponsored project. A read-only plan of the profile creates 18 resources and changes nothing existing. Once the fix is validated, the shared pin can move to `VIA_CONTROL_PLANE` and `VIA_KUBELET` regression coverage can take over the profile slot, with the same inputs.
+**Validation run.**
 
-Both use the same region, zones, Kubernetes minor and topology so suite results are comparable; they must not run tests at the same time because their combined CPU/IP quota at 20 workers is not sized for it (sequential runs, or a CI matrix with `max-parallel: 1`).
+1. Set `node_creation_mode = "VIA_CONTROL_PLANE"` and apply; wait for `RUNNING` plus the new reported mode.
+2. `make e2e-deploy` and `make e2e-tests E2E_SELECTION=standard GINKGO_PROCS=20`, from the branch under test. The runner lease is per cluster.
+3. Switch back to `VIA_KUBELET` when done, unless the fix is merged.
 
-**Infrastructure changes (`deploy/terraform`, `deploy/terraform-e2e`).**
+This is what was done by hand, with a `gcloud` flip on a temporary cluster, for the evidence in this proposal.
 
-1. Done in this PR: `node_creation_mode` input on the cluster module and the e2e root, `google` provider 7.46.2 (the field needs 7.36.0 or later), shared config pinned to `VIA_KUBELET`, `profiles/control-plane.*` committed, guard allow-list, verified by the read-only plans described in section 8 and above.
-2. Profile files under `deploy/terraform-e2e/profiles/` (non-secret variables plus a backend config with its own state prefix, `karpenter/e2e-cp`). The `prefix` guard in `variables.tf` changes from "only `karpenter-e2e`" to an explicit allow-list of the known profile prefixes, so an arbitrary prefix is still rejected in the sponsored project. A distinct `controller_role_id` (custom role IDs are project-scoped) and non-overlapping `additional_pod_ranges` names follow from the prefix.
-3. README: how to create, use and retire a profile, the cost (a second regional control plane and one system node), and the rule that applying or destroying a profile is a separate live operation needing approval.
+**Coverage of both modes afterwards.** Running both modes continuously needs two environments (a second cluster with its own prefix and state) or switching one cluster between runs. Neither is designed here; it can be revisited once control plane creation is the default, since `VIA_KUBELET` would then be the mode needing a pinned environment. The specs self-skip, so the same suites run unchanged on either.
 
-**Tier 1: validate once.**
-
-1. Apply the pinned Terraform config (the `control-plane` profile). The cluster operation takes 4 to 15 minutes and `clusters.get` keeps reporting the old mode until it ends; wait for `RUNNING` plus `VIA_CONTROL_PLANE`, and check the mode again after the run.
-2. `make e2e-deploy` and `make e2e-tests E2E_SELECTION=standard GINKGO_PROCS=20` with the profile's `E2E_PREFIX`, from the branch under test. The runner lease is per cluster.
-3. For a temporary profile, retire it (Terraform destroy) when done.
-
-This is what was done by hand, with a `gcloud` flip, for the evidence in this proposal; tier 1 makes it repeatable and records it with a report.
-
-**Tier 2: both profiles in CI.** The on-demand e2e pipeline (proposal 0005, #708) takes the profile (prefix) as an input, defaulting to the shared cluster, and releases run both. Because two clusters share the project, `e2e-check-clean.sh` must filter by the cluster label `goog-k8s-cluster-name` instead of the name prefix `karpenter-` so one profile's check does not report the other's instances.
-
-**Tier 3 (optional): default-flip canary.** A scheduled job creates a throwaway cluster **without** specifying the mode on the newest RAPID version, records the mode GKE chose, runs the provisioning smoke spec below, and tears the cluster down. It is the only check that observes what the default actually is on the day it changes, independent of any pinned profile. Release-note review (`gke-release-notes-review`) is the cheap alternative.
+**Optional: default-flip canary.** A scheduled job creates a throwaway cluster **without** specifying the mode on the newest RAPID version, records the mode GKE chose, runs the registration spec below, and tears the cluster down. It is the only check that observes what the default actually is on the day it changes, independent of any pinned environment. Release-note review (`gke-release-notes-review`) is the cheap alternative.
 
 **Test changes.**
 
@@ -202,15 +189,15 @@ This is what was done by hand, with a `gcloud` flip, for the evidence in this pr
   5. Delete the NodePool before the node is Ready and assert no Node or VM is left (the creation-versus-delete race).
 - On a registration timeout the spec dumps a diagnostic bundle instead of a bare timeout: NodeClaim conditions, CSRs for the instance (state and approver), Node events, `NodeRegistrationChecker` events, and the cluster's mode. This is exactly the evidence that took manual work to collect here.
 - Runner report (`hack/e2e-runner`) gains an `Environment` line with Kubernetes version and node creation mode, read from the GKE API using the `PROJECT_ID`, `CLUSTER_NAME` and `CLUSTER_LOCATION` the runner already receives, so a report can never be mistaken for the wrong profile.
-- Existing suites run unchanged in both profiles. No spec deletes Node objects or restarts kubelets today (checked by search), so no existing spec is expected to depend on kubelet self-registration; the first control-plane run confirms it.
+- Existing suites run unchanged in either mode. No spec deletes Node objects or restarts kubelets today (checked by search), so no existing spec is expected to depend on kubelet self-registration; the first control-plane run confirms it.
 
 **Run order and acceptance.**
 
-1. Tier 1 against current `main`: expect the new spec to fail with the diagnostic bundle (red), and the rest of the suites to fail at registration. This proves the harness detects the issue.
-2. Tier 1 against the Phase 3 branch: the full `standard` selection passes on both profiles (green), with the report showing each profile's mode and Kubernetes minor.
-3. Keep the control-plane profile for releases and for any PR that touches registration, CSR approval, bootstrap metadata or instance creation.
+1. Validation run against current `main`: expect the new spec to fail with the diagnostic bundle (red), and the rest of the suites to fail at registration. This proves the harness detects the issue.
+2. Validation run against the Phase 3 branch: the full `standard` selection passes (green), with the report showing the cluster's mode and Kubernetes minor.
+3. Re-run in `VIA_CONTROL_PLANE` for releases and for any PR that touches registration, CSR approval, bootstrap metadata or instance creation, until both modes have continuous coverage.
 
-**Cost and limits.** A second regional control plane plus one `n2-standard-2` system node (order of magnitude `$100` per month); tier 1 pays only for the validation window. Running both profiles doubles the quota need only if they run concurrently, which this design forbids. GPU and extended local SSD stay outside `standard` as today.
+**Cost and limits.** No new infrastructure: the validation reuses the shared cluster. Flipping the mode takes 4 to 15 minutes. GPU and extended local SSD stay outside `standard` as today.
 
 ## Risks and Mitigations
 
@@ -241,10 +228,10 @@ This is what was done by hand, with a `gcloud` flip, for the evidence in this pr
 
 ### E2E / Integration Tests
 
-- Control-plane profile: launch, registration, `karpenter.sh/registered`/`initialized`, GKE readiness labels, GPU, local-SSD and secondary-boot-disk labels, label diff against a MIG node, CSR approval and certificate rotation, termination, no leaked Nodes.
+- `VIA_CONTROL_PLANE` cluster: launch, registration, `karpenter.sh/registered`/`initialized`, GKE readiness labels, GPU, local-SSD and secondary-boot-disk labels, label diff against a MIG node, CSR approval and certificate rotation, termination, no leaked Nodes.
 - Claim deleted before registration: Node removed (core finalizer path and CCM safety net), no orphan.
 - Negative: no Node is created for a non-provider claim or an unenrolled claim.
-- Kubelet profile regression: unchanged timing and no controller-created Nodes (annotation absent); a forced early-creation case.
+- `VIA_KUBELET` cluster regression: unchanged timing and no controller-created Nodes (annotation absent); a forced early-creation case.
 - Flip test (manual or nightly): `KUBELET` to `CONTROL_PLANE` mid-run exercises the fallback.
 - The spec runs on every GKE minor the docs claim to support.
 
@@ -286,7 +273,7 @@ Typed `kube-labels` reader, the `nodecreation` controller, `nodeCreation` settin
 
 ### Phase 4 - Validation and rollout
 
-Control-plane e2e profile (section 9: tier 1 first, then both profiles in CI), the `registration` spec and diagnostics, `MaxK8sVersion` update, migration note, release notes. Decide, from data, whether always creating the Node in every mode should replace mode detection (see Alternatives).
+The control-plane validation run (section 9), the `registration` spec and diagnostics, `MaxK8sVersion` update, migration note, release notes. Decide, from data, whether always creating the Node in every mode should replace mode detection (see Alternatives).
 
 ---
 

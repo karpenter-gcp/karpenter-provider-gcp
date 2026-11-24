@@ -29,7 +29,17 @@ func (o *Options) Validate() error {
 		validatePositiveDuration(ipSpaceExhaustedTTLFlagName, o.IPSpaceExhaustedTTL),
 		validatePositiveDuration(unsupportedConfigurationTTLFlagName, o.UnsupportedConfigurationTTL),
 		validatePositiveDuration(launchTimeoutFlagName, o.LaunchTimeout),
+		o.validateNodeCreation(),
 	)
+}
+
+func (o *Options) validateNodeCreation() error {
+	switch o.NodeCreation {
+	case NodeCreationAuto, NodeCreationKubelet:
+		return nil
+	default:
+		return fmt.Errorf("%s must be %q or %q, got %q", nodeCreationFlagName, NodeCreationAuto, NodeCreationKubelet, o.NodeCreation)
+	}
 }
 
 func (o *Options) validateQuotaExceededTTL() error {

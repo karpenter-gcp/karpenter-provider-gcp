@@ -158,6 +158,10 @@ spec:
             - name: LAUNCH_TIMEOUT
               value: "{{ . }}"
             {{- end }}
+            {{- with .Values.controller.settings.nodeCreation }}
+            - name: NODE_CREATION
+              value: "{{ . }}"
+            {{- end }}
             - name: METRICS_PORT
               value: "{{ .Values.controller.metrics.port }}"
             - name: KARPENTER_SERVICE

@@ -16,7 +16,12 @@ limitations under the License.
 
 package gke
 
-import containerv1 "google.golang.org/api/container/v1"
+import (
+	"context"
+	"fmt"
+
+	containerv1 "google.golang.org/api/container/v1"
+)
 
 // NodeCreationMode is how GKE creates Node objects for a cluster.
 type NodeCreationMode string
@@ -41,4 +46,15 @@ func NodeCreationModeOf(cluster *containerv1.Cluster) NodeCreationMode {
 		return NodeCreationModeControlPlane
 	}
 	return NodeCreationModeKubelet
+}
+
+// ResolveNodeCreationMode returns the node creation mode of the provider's cluster
+// from the cluster configuration the provider already caches. Callers must not
+// cache the result: use Provider.InvalidateClusterConfig to force a fresh read.
+func ResolveNodeCreationMode(ctx context.Context, p Provider) (NodeCreationMode, error) {
+	cluster, err := p.GetClusterConfig(ctx)
+	if err != nil {
+		return "", fmt.Errorf("reading node creation mode: %w", err)
+	}
+	return NodeCreationModeOf(cluster), nil
 }

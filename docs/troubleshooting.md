@@ -200,6 +200,33 @@ Pending CSRs for Karpenter nodes should be approved automatically. If they are s
 
 ---
 
+## NodeClaim stays unregistered although the VM runs
+
+Symptom: the VM is `RUNNING`, its kubelet requested a certificate and the CSR was approved, but the NodeClaim shows `Registered=Unknown` (`NodeNotFound`) until it times out after 15 minutes and is replaced.
+
+The usual cause is a cluster with control plane node creation, where GKE does not create a `Node` for Karpenter VMs:
+
+```sh
+gcloud container clusters describe <cluster> --location <location> --format='value(nodeCreationConfig.nodeCreationMode)'
+```
+
+`VIA_CONTROL_PLANE` means Karpenter must create the `Node` itself (`NODE_CREATION=auto`, the default). Check the NodeClaim for the `kubelet-enrolled-at` annotation (set when the CSR was approved) and its events:
+
+```sh
+kubectl get nodeclaim <name> -o jsonpath='{.metadata.annotations}'
+kubectl describe nodeclaim <name>
+```
+
+- `NodeCreatedByController`: Karpenter created the `Node`; continue with the kubelet and the cloud controller manager.
+- `NodeCreationSkipped` mentioning `NODE_CREATION=kubelet`: set it back to `auto`.
+- `NodeNameCollision`: a different `Node` already uses the instance name or provider ID; Karpenter leaves it unchanged. Delete the stale `Node` if the instance it describes is gone.
+- No annotation: the CSR was never approved; see [CSR not approved](#csr-certificate-signing-request-not-approved).
+- A `Node` exists but never becomes Ready, and GKE agents (`anetd`, the metadata server) fail: compare the `Node`'s labels and taints with a GKE-managed node's. A controller-created `Node` carries the annotation `karpenter.k8s.gcp/created-by: nodecreation-controller`.
+
+See [Node creation](settings.md#node-creation) for the setting and its limits.
+
+---
+
 ## Org policy rejections (ShieldedVM / CMEK)
 
 Some organizations enforce GCP org policies that require Shielded VM or CMEK disk encryption on all instances. If instance creation fails with an org policy violation, configure the relevant fields in `GCENodeClass`:

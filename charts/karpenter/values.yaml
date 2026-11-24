@@ -212,6 +212,13 @@ controller:
     # deleted and replaced (e.g. `10m`). Leave empty for the controller default of 5m. Must be
     # positive. Corresponds to the LAUNCH_TIMEOUT env var.
     launchTimeout: ""
+    # -- Who creates the Node for a launched NodeClaim whose kubelet client certificate Karpenter
+    # approved. `auto` creates it when the GKE cluster uses control plane node creation
+    # (`VIA_CONTROL_PLANE`), which does not create Nodes for Karpenter VMs, and as a fallback when
+    # no Node appears within 45s of the approval on a `VIA_KUBELET` cluster. `kubelet` never creates
+    # Nodes and restores the behavior before this setting existed. Leave empty for `auto`.
+    # Corresponds to the NODE_CREATION env var.
+    nodeCreation: ""
 
 # -- Optional node-problem-detector deployment that watches the GCE metadata server
 # for Spot preemption notices and sets the GCESpotPreempting node condition, which

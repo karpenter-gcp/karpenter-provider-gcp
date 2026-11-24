@@ -1491,10 +1491,15 @@ func gpuInstanceMetadata(nodeClass *v1alpha1.GCENodeClass, instanceType *cloudpr
 		labels[v1alpha1.LabelGKEMaxSharedClientsPerGPU] = fmt.Sprintf("%d", sharing.MaxSharedClientsPerGPU)
 	}
 
+	return labels, gpuTaints(nodeClass)
+}
+
+// gpuTaints returns the taints a GPU node carries at launch.
+func gpuTaints(nodeClass *v1alpha1.GCENodeClass) []corev1.Taint {
 	if nodeClass.Spec.AutoGPUTaint {
-		return labels, []corev1.Taint{{Key: "nvidia.com/gpu", Value: "present", Effect: corev1.TaintEffectNoSchedule}}
+		return []corev1.Taint{{Key: "nvidia.com/gpu", Value: "present", Effect: corev1.TaintEffectNoSchedule}}
 	}
-	return labels, nil
+	return nil
 }
 
 // setupServiceAccounts configures service accounts for the instance.
@@ -1928,6 +1933,11 @@ func (p *DefaultProvider) syncInstances(ctx context.Context) error {
 					Labels:       inst.Labels,
 					Tags:         inst.Labels,
 					Status:       inst.Status,
+				}
+				if kubeLabels, _, err := metadata.KubeLabelsFromCompute(inst.Metadata); err != nil {
+					instance.KubeLabelsErr = err
+				} else {
+					instance.KubeLabels = kubeLabels
 				}
 				instances = append(instances, instance)
 			}

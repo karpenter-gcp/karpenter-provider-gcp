@@ -42,10 +42,15 @@ type Instance struct {
 	InstanceID            string            `json:"instanceId"`
 	InstanceTemplate      string            `json:"instanceTemplate"`
 	Labels                map[string]string `json:"labels"`
-	Location              string            `json:"location"`
-	Name                  string            `json:"name"`
-	ProjectID             string            `json:"projectId"`
-	Status                string            `json:"status"`
-	Tags                  map[string]string `json:"tags"`
-	Type                  string            `json:"type"`
+	// KubeLabels is the kube-labels metadata item written at launch, the labels a
+	// Node for this instance carries. It is nil when the instance has no such item
+	// or it is malformed (KubeLabelsErr). No other metadata item is retained.
+	KubeLabels    map[string]string `json:"kubeLabels,omitempty"`
+	KubeLabelsErr error             `json:"-"`
+	Location      string            `json:"location"`
+	Name          string            `json:"name"`
+	ProjectID     string            `json:"projectId"`
+	Status        string            `json:"status"`
+	Tags          map[string]string `json:"tags"`
+	Type          string            `json:"type"`
 }

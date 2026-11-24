@@ -17,6 +17,8 @@ limitations under the License.
 package gke
 
 import (
+	"context"
+	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -43,4 +45,26 @@ func TestNodeCreationModeOf(t *testing.T) {
 
 func cluster(mode string) *containerv1.Cluster {
 	return &containerv1.Cluster{NodeCreationConfig: &containerv1.NodeCreationConfig{NodeCreationMode: mode}}
+}
+
+type clusterConfigStub struct {
+	Provider
+	cluster *containerv1.Cluster
+	err     error
+}
+
+func (s clusterConfigStub) GetClusterConfig(context.Context) (*containerv1.Cluster, error) {
+	return s.cluster, s.err
+}
+
+func TestResolveNodeCreationMode(t *testing.T) {
+	mode, err := ResolveNodeCreationMode(context.Background(), clusterConfigStub{cluster: cluster("VIA_CONTROL_PLANE")})
+	require.NoError(t, err)
+	require.Equal(t, NodeCreationModeControlPlane, mode)
+
+	// A failed cluster read must not look like the kubelet mode, or the caller
+	// would act on a guess.
+	apiErr := errors.New("cluster read failed")
+	_, err = ResolveNodeCreationMode(context.Background(), clusterConfigStub{err: apiErr})
+	require.ErrorIs(t, err, apiErr)
 }

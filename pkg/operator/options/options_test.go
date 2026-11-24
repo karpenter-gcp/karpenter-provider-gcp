@@ -156,3 +156,42 @@ func TestCapacityBackoffDurations(t *testing.T) {
 		}
 	}
 }
+
+func TestNodeCreation(t *testing.T) {
+	requiredArgs := []string{"--project-id=p", "--cluster-name=c", "--cluster-location=us-central1"}
+
+	tests := []struct {
+		name    string
+		env     *string
+		args    []string
+		want    string
+		wantErr string
+	}{
+		{name: "unset is auto", want: NodeCreationAuto},
+		{name: "env kubelet", env: ptr.To("kubelet"), want: NodeCreationKubelet},
+		{name: "flag takes precedence over env", env: ptr.To("kubelet"), args: []string{"--node-creation=auto"}, want: NodeCreationAuto},
+		{name: "unknown value is rejected", env: ptr.To("always"), wantErr: `node-creation must be "auto" or "kubelet"`},
+		{name: "empty value is rejected", env: ptr.To(""), wantErr: `node-creation must be "auto" or "kubelet"`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.env != nil {
+				t.Setenv(nodeCreationEnvVarName, *tt.env)
+			} else {
+				require.NoError(t, os.Unsetenv(nodeCreationEnvVarName))
+			}
+
+			o := &Options{}
+			fs := &coreoptions.FlagSet{FlagSet: flag.NewFlagSet("test", flag.ContinueOnError)}
+			o.AddFlags(fs)
+			err := o.Parse(fs, append(requiredArgs, tt.args...)...)
+
+			if tt.wantErr != "" {
+				require.ErrorContains(t, err, tt.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tt.want, o.NodeCreation)
+		})
+	}
+}

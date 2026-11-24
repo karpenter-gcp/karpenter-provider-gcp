@@ -161,6 +161,16 @@ var (
 	AnnotationClusterNameTaggedCompatability = apis.CompatibilityGroup + "/cluster-name-tagged"
 	AnnotationGCENodeClassHashVersion        = apis.Group + "/gcenodeclass-hash-version"
 	AnnotationInstanceTagged                 = apis.Group + "/tagged"
+	// AnnotationKubeletEnrolledAt records, as RFC 3339 time, when the CSR controller
+	// approved the bootstrap kubelet client certificate of a launched NodeClaim. The
+	// node creation controller treats it as proof that the VM's kubelet authenticated.
+	AnnotationKubeletEnrolledAt = apis.Group + "/kubelet-enrolled-at"
+	// AnnotationNodeCreatedBy marks a Node created by this provider instead of the
+	// kubelet or GKE's control plane.
+	AnnotationNodeCreatedBy = apis.Group + "/created-by"
+	// NodeCreatedByController is the AnnotationNodeCreatedBy value for the node
+	// creation controller.
+	NodeCreatedByController = "nodecreation-controller"
 
 	TagNodeClaim = coreapis.Group + "/nodeclaim"
 	TagName      = "Name"

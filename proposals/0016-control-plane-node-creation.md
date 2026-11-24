@@ -1,6 +1,6 @@
 # Proposal: Support GKE Control Plane Node Creation
 
-- **Status**: Draft
+- **Status**: Implemented
 - **Authors**: @dm3ch
 - **Created**: 2026-11-21
 - **Related Issues**: [#798](https://github.com/karpenter-gcp/karpenter-provider-gcp/issues/798), [#778](https://github.com/karpenter-gcp/karpenter-provider-gcp/issues/778), [#790](https://github.com/karpenter-gcp/karpenter-provider-gcp/issues/790)

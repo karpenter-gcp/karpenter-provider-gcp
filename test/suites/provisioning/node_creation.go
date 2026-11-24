@@ -18,6 +18,7 @@ package provisioning
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -56,11 +57,7 @@ var _ = Describe("Node creation mode", Label("suite:provisioning"), func() {
 	// Mode independent: a NodeClaim deleted before it registers must not leave a Node
 	// or a VM behind, including when a Node is created for it around the deletion.
 	It("leaves no Node or VM when the NodePool is deleted before registration", func(ctx SpecContext) {
-		name := newNodeCreationName("delete")
-		setupNodeCreationPool(ctx, name)
-
-		env.WaitForNodeClaimLaunched(ctx, name)
-		providerID := launchedProviderID(ctx, name)
+		name, providerID := launchUnregisteredNodeClaim(ctx)
 		GinkgoWriter.Printf("[action] deleting NodePool %s while %s is not registered yet\n", name, providerID)
 		env.DeleteDeployment(ctx, name)
 		env.DeleteNodePool(ctx, name)
@@ -86,9 +83,10 @@ var _ = Describe("Node creation mode", Label("suite:provisioning"), func() {
 })
 
 // runRegistrationTest provisions one node and asserts the registration contract that
-// holds in every node creation mode: the Node appears promptly and exactly once,
-// finishes Karpenter registration, carries GKE's readiness labels and runs GKE's
-// DaemonSets. It returns the Node for mode-specific assertions.
+// holds in every node creation mode: the NodeClaim's Node is Ready within the
+// registration bound with no replacement claim, finishes Karpenter registration,
+// carries GKE's readiness labels and runs every kube-system DaemonSet meant for it.
+// It returns the Node for mode-specific assertions.
 func runRegistrationTest(ctx context.Context) *corev1.Node {
 	name := newNodeCreationName("register")
 	setupNodeCreationPool(ctx, name)
@@ -109,28 +107,25 @@ func runRegistrationTest(ctx context.Context) *corev1.Node {
 	})
 
 	env.WaitForNodeClaimLaunched(ctx, name)
-	pod := env.WaitForRunningPod(ctx, name)
-	Expect(pod.Spec.NodeName).NotTo(BeEmpty())
-	node, err := env.KubeClient.CoreV1().Nodes().Get(ctx, pod.Spec.NodeName, metav1.GetOptions{})
-	Expect(err).NotTo(HaveOccurred())
+	// The bound covers registration and readiness, measured from NodeClaim creation,
+	// and fails if the claim is replaced: a replacement that finally registers would
+	// otherwise pass for a launch, time out and replace loop.
+	node, claim := env.WaitForClaimNodeReady(ctx, name, environment.RegistrationBound)
 	provisionedNodeName = node.Name
+	GinkgoWriter.Printf("[result] node %s appeared %s and was Ready %s after NodeClaim %s\n", node.Name,
+		node.CreationTimestamp.Sub(claim.GetCreationTimestamp().Time), time.Since(claim.GetCreationTimestamp().Time), claim.GetName())
 
 	env.WaitForNodeClaimInitialized(ctx, name)
-	node, err = env.KubeClient.CoreV1().Nodes().Get(ctx, node.Name, metav1.GetOptions{})
+	node, err := env.KubeClient.CoreV1().Nodes().Get(ctx, node.Name, metav1.GetOptions{})
 	Expect(err).NotTo(HaveOccurred())
 	environment.ExpectNodeRegistered(node, name)
 
-	// One NodeClaim for the whole run: a registration timeout replaces the claim, and a
-	// replacement that finally registers would otherwise pass this spec.
-	claim, err := env.GetNodeClaimForNode(ctx, node.Name)
-	Expect(err).NotTo(HaveOccurred())
 	claims, err := env.ListNodeClaimsForPool(ctx, name)
 	Expect(err).NotTo(HaveOccurred())
-	Expect(claims).To(HaveLen(1), "NodeClaim was replaced before a Node registered")
-	registration := node.CreationTimestamp.Sub(claim.GetCreationTimestamp().Time)
-	GinkgoWriter.Printf("[result] node %s appeared %s after NodeClaim %s\n", node.Name, registration, claim.GetName())
-	Expect(registration).To(BeNumerically("<", environment.RegistrationBound),
-		"node took %s to appear, longer than %s", registration, environment.RegistrationBound)
+	Expect(claims).To(HaveLen(1), "NodeClaim was replaced after its Node registered")
+
+	pod := env.WaitForRunningPod(ctx, name)
+	Expect(pod.Spec.NodeName).To(Equal(node.Name), "the workload must run on the NodeClaim's Node")
 
 	env.ExpectGKEReadinessLabelsMatchManagedNode(ctx, node.Name)
 	env.WaitForKubeSystemDaemonSetPodsReady(ctx, node.Name)
@@ -161,6 +156,29 @@ func setupNodeCreationPool(ctx context.Context, name string) {
 	})
 	env.WaitForNodePoolReady(ctx, name)
 	env.CreateDeployment(ctx, name, name, name, karpv1.ArchitectureAmd64)
+}
+
+// launchUnregisteredNodeClaim sets up a pool and returns it once its NodeClaim has
+// launched and neither registered nor got a Node, so the deletion that follows
+// really happens before registration. A claim that registers before the check
+// is discarded and the setup repeated; the spec fails rather than silently becoming
+// an ordinary deletion test when the window is missed every time.
+func launchUnregisteredNodeClaim(ctx context.Context) (name, providerID string) {
+	const attempts = 3
+	for attempt := 1; attempt <= attempts; attempt++ {
+		name = newNodeCreationName("delete")
+		setupNodeCreationPool(ctx, name)
+		env.WaitForNodeClaimLaunched(ctx, name)
+		providerID = launchedProviderID(ctx, name)
+		if env.NodeClaimUnregistered(ctx, name, providerID) {
+			return name, providerID
+		}
+		GinkgoWriter.Printf("[retry] attempt %d/%d: %s registered before it could be deleted; trying a new pool\n", attempt, attempts, name)
+		env.DeleteDeployment(ctx, name)
+		env.DeleteNodePool(ctx, name)
+	}
+	Fail(fmt.Sprintf("the NodeClaim registered before the NodePool could be deleted in each of %d attempts, so deletion before registration was not exercised", attempts))
+	return "", ""
 }
 
 // launchedProviderID returns the providerID of the pool's first launched NodeClaim.

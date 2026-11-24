@@ -1,6 +1,6 @@
 # Proposal: Support GKE Control Plane Node Creation
 
-- **Status**: Implemented
+- **Status**: In Review (implemented by [#803](https://github.com/karpenter-gcp/karpenter-provider-gcp/pull/803))
 - **Authors**: @dm3ch
 - **Created**: 2026-11-21
 - **Related Issues**: [#798](https://github.com/karpenter-gcp/karpenter-provider-gcp/issues/798), [#778](https://github.com/karpenter-gcp/karpenter-provider-gcp/issues/778), [#790](https://github.com/karpenter-gcp/karpenter-provider-gcp/issues/790)
@@ -79,7 +79,7 @@ A new controller, `nodecreation`, reconciles provider-owned NodeClaims. When a c
 
 #### 1. Mode detection (`pkg/providers/gke`)
 
-`pkg/providers/gke` already owns shared cluster facts and caches `GetClusterConfig`. Add `NodeCreationMode(ctx) (NodeCreationMode, error)` reading `Cluster.NodeCreationConfig.NodeCreationMode`; nil, empty or unknown-but-not-control-plane maps to `Kubelet`. Treat only an exact `VIA_CONTROL_PLANE` as control plane. No new API call and no new IAM.
+`pkg/providers/gke` already owns shared cluster facts and caches `GetClusterConfig`. Add `gke.ResolveNodeCreationMode(ctx, provider) (NodeCreationMode, error)`, built on `NodeCreationModeOf` over the provider's cached cluster config and reading `Cluster.NodeCreationConfig.NodeCreationMode`; nil, empty or unknown-but-not-control-plane maps to `Kubelet`. Treat only an exact `VIA_CONTROL_PLANE` as control plane. No new API call and no new IAM.
 
 Log the resolved mode once at startup, and again on change, with the `Registered=Unknown NodeNotFound` troubleshooting hint. Callers must not cache the result themselves; use the provider cache and `InvalidateClusterConfig`.
 
@@ -253,7 +253,7 @@ The feature is complete when:
 
 ## Implementation Phases
 
-Phases 1 to 3 are separate PRs, in this order.
+Phases 0 to 3 are implemented together in #803, so the validation run of Phase 4 can exercise the whole path. They are described separately because each is shippable and reviewable on its own.
 
 ### Phase 0 - Validation prerequisites (with this proposal)
 
@@ -273,7 +273,7 @@ Typed `kube-labels` reader, the `nodecreation` controller, `nodeCreation` settin
 
 ### Phase 4 - Validation and rollout
 
-The control-plane validation run (section 9), the `registration` spec and diagnostics, `MaxK8sVersion` update, migration note, release notes. Decide, from data, whether always creating the Node in every mode should replace mode detection (see Alternatives).
+The `registration` spec and diagnostics, the `MaxK8sVersion` update and the migration note are part of #803. Still to do: the control-plane validation run (section 9), release notes. Decide, from data, whether always creating the Node in every mode should replace mode detection (see Alternatives).
 
 ---
 

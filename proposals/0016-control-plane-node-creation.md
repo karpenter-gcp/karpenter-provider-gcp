@@ -112,6 +112,8 @@ Action: re-read the NodeClaim from the API (not the cache) and skip if it is now
 - Any other error: return for backoff; there is no partial state.
 - Never `Update`/`Patch` an existing Node. After creation the kubelet, CCM and core own it.
 
+**Why the Node is created after enrollment, not when the NodeClaim is created or launched.** The enrollment annotation is the only point at which the provider knows that the VM booted and its kubelet obtained an approved client certificate, so it keeps the invariant that a Node follows an authenticated kubelet (the guarantee `gcp-controller-manager` gives natively). It also decides who is responsible for the Node. A Node created at claim creation or launch would exist for VMs that never boot or never enroll, for claims deleted during launch, and for claims whose CSR is refused; each such Node is an orphan that only core's finalizer or the CCM could remove, and the creation-versus-delete race window would cover the whole boot. Gating on enrollment narrows it to the seconds between the annotation and the `Create`. Verification added to CSR approval (#795) also gates Node creation without a change here. The cost is small: in the live run below the Node was created in the same second as the enrollment annotation (about 78 s after the NodeClaim was created, bounded by VM boot), and the claim registered one second later, so the ordering adds no measurable latency.
+
 #### 4. Node content
 
 The `Node` must equal what the kubelet would have registered and must not require the controller to read secret-bearing metadata.
@@ -122,6 +124,17 @@ The `Node` must equal what the kubelet would have registered and must not requir
 - `spec.providerID`: `gce://<project>/<zone>/<name>`.
 - `metadata.annotations`: `karpenter.k8s.gcp/created-by: nodecreation-controller` for diagnostics; neither core registration nor the kubelet removes unknown annotations.
 - No owner references or finalizers. Core registration adds them. Until then the Node has no core termination finalizer, so cleanup of a claim deleted before registration depends on core's NodeClaim finalizer (deletes Nodes by `providerID`) and, for the narrow create-versus-delete race that a re-read cannot make atomic, on the cloud controller manager's lifecycle controller removing Nodes whose instance is gone. This is relied upon and tested, not assumed.
+
+**Node deletion.** The provider never deletes Nodes and this proposal adds no deletion code. Ownership by phase:
+
+| Phase                                                                                    | Who removes the Node                                                                                                                                                                                                     | Status                                                               |
+|------------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------|
+| Registered, NodeClaim deleted (consolidation, expiry, drift, NodePool or claim deletion) | Core Karpenter. Registration adds the `karpenter.sh/termination` finalizer and the NodeClaim owner reference to the controller-created Node; core's termination flow drains it, deletes the VM and removes the finalizer | Verified live (below)                                                |
+| NodeClaim deleted before registration                                                    | Core's NodeClaim finalizer deletes Nodes by `providerID`; the CCM lifecycle controller covers the create-versus-delete race                                                                                              | Relied upon; covered by the deletion spec, not yet run               |
+| Registered Node whose VM disappears outside Karpenter (preemption, manual delete)        | Expected: core NodeClaim garbage collection and/or the CCM lifecycle controller                                                                                                                                          | **Not verified in `VIA_CONTROL_PLANE`** (open question 6)            |
+| Healthy registered Node                                                                  | Nothing; GKE does not delete a Node it did not create while its VM runs                                                                                                                                                  | Sampled stable for about 10 minutes, until the NodeClaim was deleted |
+
+Live check (2026-11-25), on the shared e2e cluster in `VIA_CONTROL_PLANE` (control plane 1.37.1-gke.1552000) running this branch: the provider created the Node, which the kubelet adopted; the NodeClaim reached `Registered`, `Initialized` and `Ready`, and the Node carried the finalizer and owner reference. The Node kept its UID and stayed `Ready` with no `deletionTimestamp` in samples taken for about 10 minutes while its VM ran. Deleting the NodeClaim, with a workload pod bound to the node, removed the Node and the VM within 93 s with no provider involvement. The out-of-band VM deletion row was not exercised. If it shows that nothing removes such a Node, the follow-up is a provider-side reconcile that deletes a controller-created Node whose instance is gone, limited to Nodes carrying `karpenter.k8s.gcp/created-by` and no longer backed by a NodeClaim; until then no such code is justified.
 
 **Why `kube-labels` and not `--node-labels`.** The provider maintains both sets and they deliberately differ: `kube-labels` also carries labels GKE applies through a trusted component and that a kubelet is not allowed to set, such as `cloud.google.com.node-restriction.kubernetes.io/gke-secondary-boot-disk-*` (written only via `SetKubeLabel`) and `karpenter.sh/registered`. `--node-labels`, the kubelet's own registration set, is therefore not a complete picture. Using `kube-labels` also means no secret-bearing `kube-env` parsing.
 
@@ -230,6 +243,7 @@ This is what was done by hand, with a `gcloud` flip on a temporary cluster, for 
 
 - `VIA_CONTROL_PLANE` cluster: launch, registration, `karpenter.sh/registered`/`initialized`, GKE readiness labels, GPU, local-SSD and secondary-boot-disk labels, label diff against a MIG node, CSR approval and certificate rotation, termination, no leaked Nodes.
 - Claim deleted before registration: Node removed (core finalizer path and CCM safety net), no orphan.
+- Registered node whose VM is deleted out of band: Node and NodeClaim removed, and by whom (audit log); the first run settles open question 6.
 - Negative: no Node is created for a non-provider claim or an unenrolled claim.
 - `VIA_KUBELET` cluster regression: unchanged timing and no controller-created Nodes (annotation absent); a forced early-creation case.
 - Flip test (manual or nightly): `KUBELET` to `CONTROL_PLANE` mid-run exercises the fallback.
@@ -293,6 +307,10 @@ Removes mode detection and flip races, and exercises one path. Rejected for the 
 
 Simple, but couples VM launch to Kubernetes writes before the kubelet has authenticated and breaks the invariant that a Node follows an authenticated kubelet. A separate controller is idempotent, retryable and testable.
 
+### Create the Node when the NodeClaim is created or launched
+
+Saves the wait for enrollment, but creates Nodes for VMs that never boot or enroll and widens the create-versus-delete race to the whole boot, so more cleanup falls on core's finalizer and the CCM. Rejected for the reasons given under section 3; the enrollment wait was about one second in the live run.
+
 ### Use the core `NodeLifecycleHook`
 
 The hook only gates when registration completes; it cannot create the Node.
@@ -325,3 +343,4 @@ Cheap, and shipped as Phase 1 for visibility, but it leaves the default mode of 
 3. **Certificate rotation in control-plane mode**: `system:node:<name>` renewal CSRs were not exercised. Open.
 4. **Grace period**: 45 s from enrollment is based on observed timing; tune after e2e data.
 5. **Reported default**: new 1.37.2 clusters were `VIA_KUBELET` despite the release note. Re-verify after the release note's version threshold is broadly rolled out.
+6. **Out-of-band VM deletion**: when the VM of a registered, controller-created Node is deleted outside Karpenter, does core NodeClaim garbage collection or the CCM lifecycle controller remove the Node in `VIA_CONTROL_PLANE`? Not yet tested; see section 4, Node deletion. Decides whether provider-side deletion handling is needed.

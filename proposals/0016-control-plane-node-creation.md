@@ -9,9 +9,9 @@
 
 ## Summary
 
-GKE can create `Node` objects from the control plane instead of letting the kubelet self-register (`NodeCreationConfig.nodeCreationMode = VIA_CONTROL_PLANE`). Karpenter GCP relies on kubelet self-registration, so on such clusters Karpenter-launched VMs boot, obtain a kubelet client certificate, and never get a `Node`. NodeClaims time out after 15 minutes and are replaced, so billed VMs churn while pods stay pending, with no error pointing at the cause.
+GKE can create `Node` objects from its control plane instead of letting the kubelet register itself (`nodeCreationConfig.nodeCreationMode = VIA_CONTROL_PLANE`). Karpenter relied on kubelet registration, so on such clusters its VMs boot, get a kubelet certificate and never get a `Node`: NodeClaims time out after 15 minutes and are replaced, VMs churn and pods stay pending.
 
-This proposal makes the provider work in both modes. The provider detects the mode from the GKE cluster read it already performs and, when the control plane will not create the `Node`, creates it itself for provider-owned, already-enrolled NodeClaims. The kubelet then adopts the existing `Node` and the core Karpenter lifecycle (registration, initialization, termination) runs unchanged. Existing `VIA_KUBELET` behavior does not change.
+The provider now creates the `Node` itself for launched, enrolled NodeClaims when the control plane will not. The kubelet adopts it and core Karpenter registration, initialization and termination run unchanged. `VIA_KUBELET` behavior does not change.
 
 ---
 
@@ -19,225 +19,123 @@ This proposal makes the provider work in both modes. The provider detects the mo
 
 ### Problem Statement
 
-The [GKE release notes of 2026-09-04, "Other changes in 1.37"](https://docs.cloud.google.com/kubernetes-engine/docs/release-notes#other_changes_in_137) state that clusters created on 1.37.0-gke.2100000 and later default to control plane node creation; the mode has been available since 1.35.3-gke.1189000 (see [Control plane node creation](https://docs.cloud.google.com/kubernetes-engine/security/control-plane-node-creation), which still labels it Preview and describes opting out with `--node-creation-mode=KUBELET`). In this mode `gcp-controller-manager` creates the `Node` after the kubelet's client CSR is approved, and an admission controller rejects kubelet `Node` creation.
+The [GKE release notes of 2026-09-04](https://docs.cloud.google.com/kubernetes-engine/docs/release-notes#other_changes_in_137) make control plane node creation the default for clusters created on 1.37.0-gke.2100000 and later. It has been available since 1.35.3-gke.1189000 and is still labeled Preview in the [GKE documentation](https://docs.cloud.google.com/kubernetes-engine/security/control-plane-node-creation). In this mode `gcp-controller-manager` creates the `Node` after the kubelet's client CSR is approved, and admission rejects kubelet `Node` creation.
 
-Evidence from a temporary cluster (GKE 1.37.1-gke.2097000, RAPID channel, Shielded nodes, Dataplane V2), 2026-11-21:
+Measured on a temporary GKE 1.37.1 cluster (2026-11-21):
 
-| Probe                                                                            | `VIA_CONTROL_PLANE`                                                                                                                        | `VIA_KUBELET`                                                                        |
-|----------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------|
-| GKE-managed (MIG) node                                                           | Node created by the control plane about 1 s after the CSR                                                                                  | Node created by the kubelet                                                          |
-| Karpenter NodeClaim                                                              | VM boots, kubelet runs, Karpenter approves the CSR, **no Node for 12+ min**; NodeClaim deleted at the 15-min registration TTL and replaced | Node appears about 55 s after NodeClaim creation, `Registered`/`Initialized`/`Ready` |
-| Standalone VM from the pool template, no NodeClaim                               | bootstrap CSR stays `Pending`; GKE does not approve non-MIG VMs                                                                            | same                                                                                 |
-| MIG signals spoofed on the Karpenter VM (`created-by` metadata, node-pool label) | no effect                                                                                                                                  | n/a                                                                                  |
+| Probe                                   | `VIA_CONTROL_PLANE`                                                     | `VIA_KUBELET`                                 |
+|-----------------------------------------|-------------------------------------------------------------------------|-----------------------------------------------|
+| GKE-managed node                        | Node created by the control plane about 1 s after the CSR               | Node created by the kubelet                   |
+| Karpenter NodeClaim                     | CSR approved, **no Node for 12+ min**; claim replaced at the 15 min TTL | Node about 55 s after claim creation, `Ready` |
+| Standalone VM, no NodeClaim             | bootstrap CSR stays `Pending`; GKE does not approve non-MIG VMs         | same                                          |
+| MIG signals spoofed on the Karpenter VM | no effect                                                               | n/a                                           |
 
-Why `gcp-controller-manager` skips Karpenter VMs is **not established**: its source is not public and audit logs were unavailable. The working hypothesis is that node creation is tied to GKE's own attested CSR approval, which standalone VMs fail.
+Why `gcp-controller-manager` skips Karpenter VMs is not established (its source is not public). Creating the `Node` by hand makes the kubelet adopt it and the NodeClaim reach `Registered`/`Initialized`/`Ready`, provided the `Node` carries `spec.providerID`, the `karpenter.sh/unregistered:NoExecute` taint **and** `node.cloudprovider.kubernetes.io/uninitialized:NoSchedule` (otherwise the cloud controller manager never initializes it and `anetd` fails with `host IP unknown`), and the kubelet's registration labels (the kubelet does not apply `--node-labels` to an existing `Node`).
 
-A manual proof of concept shows the provider can compensate. Creating the `Node` by hand makes the kubelet adopt it; the NodeClaim reached `Registered`/`Initialized`/`Ready`, a test pod ran, and every GKE DaemonSet was Running, provided the `Node` carried:
-
-- `spec.providerID`, the `karpenter.sh/unregistered=true:NoExecute` taint, **and** `node.cloudprovider.kubernetes.io/uninitialized=true:NoSchedule`. Without the second taint the cloud controller manager never initializes the node (no `InternalIP`) and `anetd` fails with `host IP unknown`.
-- The kubelet `--node-labels` set from the VM's `kube-env`. The kubelet does not apply `--node-labels` to a pre-existing `Node`; without them GKE readiness labels are missing and DaemonSets do not schedule.
-
-The e2e cluster, new 1.37 clusters, and existing clusters that opt in are therefore split across a registration path the provider has never supported. On 1.37 clusters the provider also logs an ERROR at startup (`MaxK8sVersion = 1.36.99`), which this work revisits.
-
-Observed contract gap: new 1.37.2-gke.1606000 clusters created via gcloud and via the REST API without the field came up `VIA_KUBELET` in `asia-southeast1`, so the release-note default was not reproduced. The design must not depend on when the default flips.
+New 1.37.2 clusters created without the field still came up `VIA_KUBELET` in `asia-southeast1`, so the release-note default was not reproduced; the design must not depend on when the default flips.
 
 ### Goals
 
-- Karpenter-launched nodes register, initialize and become schedulable on `VIA_CONTROL_PLANE` clusters.
-- No behavior change on `VIA_KUBELET` clusters.
-- Fail loudly and early, with an actionable message, whenever the provider cannot register nodes.
-- Do not grant the node (kubelet) identity any new privilege; the control plane keeps sole authority over `Node` creation as far as nodes are concerned.
-- Keep the design robust to mode flips (an update takes minutes and `clusters.get` reports the old mode until it finishes).
-- Make the e2e environment able to run the full suites on a 1.37 cluster in either mode.
+- Karpenter nodes register, initialize and become schedulable on `VIA_CONTROL_PLANE` clusters.
+- No behavior change on `VIA_KUBELET` clusters; an escape hatch that restores today's behavior exactly.
+- No new privilege for the node (kubelet) identity.
+- Robust to mode flips: `clusters.get` reports the old mode until an update finishes.
+- The e2e environment runs the full suites on a 1.37 cluster in either mode.
 
 ### Non-Goals
 
-- Reproducing or replacing `gcp-controller-manager` logic beyond what registration needs.
-- Autopilot, non-GKE (self-hosted) provisioning, Windows nodes.
-- Changing CSR authorization policy; that is the scope of the CSR attestation proposal in #795 / #778. This proposal only consumes its outcome.
-- Making the provider create `Node` objects in `VIA_KUBELET` mode by default (see Alternatives).
+- Replicating `gcp-controller-manager` beyond what registration needs.
+- Autopilot, self-hosted provisioning, Windows nodes.
+- Changing CSR authorization (#795, #778); this proposal only consumes its outcome.
+- Creating `Node` objects by default in `VIA_KUBELET` mode (see Alternatives).
 
 ---
 
 ## Proposal
 
-### Overview
-
 ```text
-                                  VIA_KUBELET (today, unchanged)
-NodeClaim -> Create VM -> kubelet CSR -> Karpenter approves -> kubelet creates Node -> core registers
+VIA_KUBELET (unchanged)
+  Create VM -> kubelet CSR -> approved -> kubelet creates Node -> core registers
 
-                                  VIA_CONTROL_PLANE (this proposal)
-NodeClaim -> Create VM -> kubelet CSR -> Karpenter approves -> [nodecreation controller creates Node]
-                                                              -> kubelet adopts Node -> CCM initializes
-                                                              -> core registers (finds Node by providerID)
+VIA_CONTROL_PLANE
+  Create VM -> kubelet CSR -> approved -> [nodecreation controller creates Node]
+            -> kubelet adopts Node -> CCM initializes -> core registers (finds Node by providerID)
 ```
 
-A new controller, `nodecreation`, reconciles provider-owned NodeClaims. When a claim is launched, enrolled and has no `Node`, and the cluster is in a mode in which GKE will not create it, the controller creates the `Node` from the label set the provider recorded on the NodeClaim when it launched the VM, then steps aside.
+### 1. Mode detection and setting
 
-#### Design principles
+`gke.ResolveNodeCreationMode` reads `Cluster.NodeCreationConfig.NodeCreationMode` from the provider's cached cluster config (no new API call or IAM). Only an exact `VIA_CONTROL_PLANE` counts as control plane. The mode is resolved at reconcile time, never at startup, and logged on first use and on change.
 
-The design was reviewed through the Spiral Dynamics value-systems lens, used as a checklist of concerns so that none is traded away silently. It is a review aid, not a project requirement.
+Setting `NODE_CREATION` (`controller.settings.nodeCreation`):
 
-| Concern (lens)                         | What it demands here                                                          | Decision                                                                                                                                                                                                      |
-|----------------------------------------|-------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| Safety and survival (Beige, Purple)    | Healthy clusters and existing Nodes stay untouched; failure leaves no orphans | `VIA_KUBELET` behavior is unchanged. The controller only creates a Node: it never updates or deletes one. It creates only after enrollment. `NODE_CREATION=kubelet` is the kill switch                        |
-| Immediate results (Red)                | Users on default 1.37 clusters are broken now                                 | The smallest path that registers nodes: one controller, no change to launch ordering, no change to core                                                                                                       |
-| Order and one source of truth (Blue)   | Explicit contracts, one authoritative record, validated input                 | The launch records the label set once on the NodeClaim and the CSR controller records enrollment once. The controller treats both as untrusted input and validates them. Node deletion ownership is tabulated |
-| Evidence and measurement (Orange)      | Decisions backed by data; regressions caught                                  | E2E registration bound, metrics and events, red-then-green validation. Every open question names the experiment that settles it                                                                               |
-| Community and shared ownership (Green) | Operators, maintainers, Google and the CSR work (#795) can reason about it    | Settings, troubleshooting and security docs. The CSR controller owns the enrollment annotation. Open question 1 goes to GKE. Small reviewable phases                                                          |
-| Systems and adaptability (Yellow)      | Works when the reported mode lags, across restarts and partial failures       | The mode is resolved at runtime with a grace fallback, never at startup. Reconcile is idempotent. State lives on API objects, not in memory                                                                   |
-| Long horizon (Turquoise)               | A workaround must be removable                                                | Sunset criteria under Future Direction                                                                                                                                                                        |
+| Value            | Behavior                                                                                                                                                                                                                         |
+|------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `auto` (default) | Create the Node as soon as the cluster reports `VIA_CONTROL_PLANE`. On `VIA_KUBELET`, create it only if none exists 45 s after enrollment and a forced re-read still says `VIA_KUBELET`, with a `NodeCreationModeMismatch` event |
+| `kubelet`        | Never create Nodes; today's behavior                                                                                                                                                                                             |
 
-### Design Details
+The `auto` fallback covers the stale-mode window after a flip. In observed `VIA_KUBELET` runs the kubelet registered about 1 s after its certificate, so 45 s should not race a healthy kubelet; early creation in `VIA_KUBELET` is untested and part of the e2e plan.
 
-#### 1. Mode detection (`pkg/providers/gke`)
+### 2. Enrollment and the `nodecreation` controller
 
-`pkg/providers/gke` already owns shared cluster facts and caches `GetClusterConfig`. Add `gke.ResolveNodeCreationMode(ctx, provider) (NodeCreationMode, error)`, built on `NodeCreationModeOf` over the provider's cached cluster config and reading `Cluster.NodeCreationConfig.NodeCreationMode`; nil, empty or unknown-but-not-control-plane maps to `Kubelet`. Treat only an exact `VIA_CONTROL_PLANE` as control plane. No new API call and no new IAM.
+After approving a bootstrap CSR, the CSR controller records `karpenter.k8s.gcp/kubelet-enrolled-at` (RFC 3339) on the NodeClaim, once. Whatever verification #795 adds to approval therefore gates Node creation too.
 
-Log the resolved mode once at startup, and again on change, with the `Registered=Unknown NodeNotFound` troubleshooting hint. Callers must not cache the result themselves; use the provider cache and `InvalidateClusterConfig`.
+The controller (`pkg/controllers/nodecreation`) acts only when **all** hold: the claim references this provider's `GCENodeClass`; it is launched, not deleting, with a `providerID` in the configured project; the enrollment annotation is present; it is not `Registered` and has **no** Node by `providerID` (a differently named Node with the same `providerID` is reported, not duplicated, since it would wedge the claim with `MultipleNodesFound`); and the mode gate passes. It re-reads the claim from the API, skips it if deleting, then `Create`s the Node:
 
-#### 2. Operator setting `nodeCreation`
+- `AlreadyExists` with a matching `providerID`: done. A mismatch is a collision: warning event, never mutate.
+- Any other error: backoff.
+- It never updates, patches or deletes an existing Node.
 
-New setting (`NODE_CREATION` env / `controller.settings.nodeCreation` in the chart):
+**Why after enrollment and not at launch.** Enrollment is the only point at which the provider knows the VM booted and its kubelet holds an approved certificate. That keeps the invariant that a Node follows an authenticated kubelet, and avoids Nodes for VMs that never boot or enroll, for claims deleted during boot, or for refused CSRs, each an orphan to clean up. It also narrows the create-versus-delete race from the whole boot to the seconds after enrollment. The wait costs about one second: in the live run the Node appeared in the same second as the annotation.
 
-| Value            | Behavior                                                                                                                                                                                                                                                         |
-|------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `auto` (default) | Create the Node for an enrolled claim as soon as the cluster reports `VIA_CONTROL_PLANE`; otherwise only if the claim is still without a Node a grace period (default 45 s, measured from enrollment, see section 3) after the cluster configuration was re-read |
-| `kubelet`        | Never create Nodes; current behavior and the escape hatch                                                                                                                                                                                                        |
+### 3. Node content
 
-The reported mode lags a flip: during a `KUBELET` to `CONTROL_PLANE` update `clusters.get` still returns the old value while the new behavior already applies. So when a claim is stuck, the controller first forces `InvalidateClusterConfig` and re-reads the mode; if the cluster still reports `VIA_KUBELET` it creates the Node anyway once the grace period elapsed and emits a `NodeCreationModeMismatch` warning event. In observed `VIA_KUBELET` runs the kubelet registered about 1 s after its certificate was issued, so 45 s from enrollment should not race a healthy kubelet. Adoption of an existing Node is the same kubelet code path in both modes, but creating a Node early in `VIA_KUBELET` mode is **untested**; the e2e plan includes it.
+- **Labels** come from the NodeClaim annotation `karpenter.k8s.gcp/node-labels`, a sorted `key=value` list that `CloudProvider.Create` writes once from the `kube-labels` item of the instance it just built. That is the set the VM boots with (what GKE echoes in `node.gke.io/last-applied-node-labels`), taken from the object already in hand: no extra API call, no `kube-env`, no change to `pkg/metadata`. `karpenter.sh/registered` and `initialized` are removed at write time, because core copies NodeClaim annotations onto the Node at registration and their absence before then is its race protection. The `kube-labels` set is used rather than `--node-labels` because it also carries labels only GKE's trusted components may set (for example `*.node-restriction.kubernetes.io/gke-secondary-boot-disk-*`).
+- **Taints**: `karpenter.sh/unregistered=true:NoExecute`, GPU taints from the same launch code, and `node.cloudprovider.kubernetes.io/uninitialized=true:NoSchedule`. Core applies NodeClaim and startup taints at registration.
+- `metadata.name` is the instance name; `spec.providerID` is `gce://<project>/<zone>/<name>`; annotation `karpenter.k8s.gcp/created-by: nodecreation-controller` marks the origin. No owner references or finalizers: core adds them at registration.
 
-#### 3. Enrollment evidence and the controller `pkg/controllers/nodecreation`
+**Label policy.** The controller is a trusted component, so unlike a kubelet it may set `*.node-restriction.kubernetes.io` labels, but never more than the data it reads. It parses the annotation strictly (valid keys and values, at most 16 KiB) and drops `kubernetes.io` and `k8s.io` keys a kubelet may not self-assign (`node-role.kubernetes.io/*` among them), logging once per claim. The annotation is writable by anyone who can patch NodeClaims, the same boundary as the enrollment annotation, so the filter is defense in depth.
 
-**Enrollment record.** The CSR controller (`pkg/controllers/csr`) already decides whether a kubelet client CSR belongs to a launched, unregistered, provider-owned NodeClaim. After a successful approval it also records the fact on that NodeClaim (annotation `karpenter.k8s.gcp/kubelet-enrolled-at: <RFC3339>`, written once with `NodeClaim` patch rights the controller already has). The new controller consumes this record instead of re-parsing CSRs or matching the approval reason string, and it does not depend on CSR objects surviving garbage collection. The CSR controller is also changed by the CSR attestation work in #795; ownership of that code stays with the CSR controller, so whatever verification the #795 work adds gates the annotation automatically.
+**No usable annotation** (claim launched by an older version, VM without a `kube-labels` item, or a VM adopted after an interrupted launch, which does not recover labels): one `NodeCreationSkipped` event, no Node, claim replaced at the registration timeout, exactly as before this feature. The annotation (about 1 KB) reaches every Karpenter Node in every mode because core syncs annotations; that is accepted.
 
-**Controller.** Follows the pattern of the CSR controller (operator cached client, event-driven on NodeClaim and Node, `RequeueAfter` for the grace period). For each NodeClaim, act only when **all** hold:
+### 4. Node deletion
 
-1. `spec.nodeClassRef` is a `GCENodeClass` of this provider.
-2. `Launched=True`, `DeletionTimestamp` is zero, `status.providerID` parses to `gce://<project>/<zone>/<name>` for the configured project.
-3. The enrollment annotation is present. This preserves the invariant that a Node exists only after the VM's kubelet authenticated, which `gcp-controller-manager` guarantees natively.
-4. `Registered` is not `True` and **no Node** matches the claim by `providerID`, using core's `NodeForNodeClaim` helper. A differently named Node with the same `providerID` (for example after an instance name was recycled) would wedge the claim with `Registered=False/MultipleNodesFound`, so it is detected here and reported with an event instead of creating a second Node.
-5. The mode gate from section 2 passes.
+The provider never deletes Nodes and adds no deletion code.
 
-Action: re-read the NodeClaim from the API (not the cache) and skip if it is now deleting, then `Create` the Node (section 4). Results:
+| Situation                                                            | Who removes the Node                                                                                                                                     | Status                                         |
+|----------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------|------------------------------------------------|
+| Registered, NodeClaim deleted (consolidation, expiry, drift, manual) | Core: registration adds the `karpenter.sh/termination` finalizer and owner reference; its termination flow drains, deletes the VM, removes the finalizer | Verified live                                  |
+| NodeClaim deleted before registration                                | Core's NodeClaim finalizer deletes Nodes by `providerID`; the CCM lifecycle controller covers the create-versus-delete race                              | Relied upon; deletion spec exists, not yet run |
+| Registered, VM deleted outside Karpenter                             | Expected: core NodeClaim garbage collection and/or the CCM lifecycle controller                                                                          | **Not verified** (open question 6)             |
+| Healthy registered Node                                              | Nothing                                                                                                                                                  | Stable for about 10 min in the live run        |
 
-- `AlreadyExists`: `Get` it. If `spec.providerID` matches, succeed. If not, emit a warning event, return an error and never mutate it; a different Node owning the name is a collision, not ours to repair.
-- Any other error: return for backoff; there is no partial state.
-- Never `Update`/`Patch` an existing Node. After creation the kubelet, CCM and core own it.
+Live check (2026-11-25, 1.37.1 `VIA_CONTROL_PLANE`, an earlier revision): the Node was created and adopted, the claim reached `Ready`, and deleting the NodeClaim removed the Node and VM within 93 s with no provider involvement. If out-of-band VM deletion leaves the Node behind, the follow-up is a provider reconcile that deletes a `created-by` Node whose instance is gone and which no NodeClaim backs; no such code is justified until then.
 
-**Why the Node is created after enrollment, not when the NodeClaim is created or launched.** The enrollment annotation is the only point at which the provider knows that the VM booted and its kubelet obtained an approved client certificate, so it keeps the invariant that a Node follows an authenticated kubelet (the guarantee `gcp-controller-manager` gives natively). It also decides who is responsible for the Node. A Node created at claim creation or launch would exist for VMs that never boot or never enroll, for claims deleted during launch, and for claims whose CSR is refused; each such Node is an orphan that only core's finalizer or the CCM could remove, and the creation-versus-delete race window would cover the whole boot. Gating on enrollment narrows it to the seconds between the annotation and the `Create`. Verification added to CSR approval (#795) also gates Node creation without a change here. The cost is small: in the live run below the Node was created in the same second as the enrollment annotation (about 78 s after the NodeClaim was created, bounded by VM boot), and the claim registered one second later, so the ordering adds no measurable latency.
+### 5. RBAC, observability, version guard
 
-#### 4. Node content
+- Chart `clusterrole-core.yaml` adds `create` to the existing `nodes` rule. No new IAM (`compute.instances.get` already required). The controller never uses node credentials.
+- Events on the NodeClaim: `NodeCreatedByController`, `NodeCreationSkipped`, `NodeCreationModeMismatch`, `NodeNameCollision`. Metric `karpenter_gcp_nodecreation_total{result="created|exists|collision|error"}`. Docs: [Node creation](../docs/node-creation.md), settings, troubleshooting, [CSR approval](../docs/security/csr-approval.md), `MIGRATION.md`.
+- `MaxK8sVersion` is raised from 1.36.99 to 1.37.99, which removes the startup ERROR on 1.37 clusters. Karpenter provisioned and ran workloads on 1.37.1 in `VIA_KUBELET` mode.
 
-The `Node` must equal what the kubelet would have registered and must not require the controller to read secret-bearing metadata.
+### 6. E2E and infrastructure
 
-- **Labels** come from the NodeClaim annotation `karpenter.k8s.gcp/node-labels`, a sorted `key=value` list that `CloudProvider.Create` writes once from the `kube-labels` item of the instance it just built. That is the exact set the VM boots with (what GKE echoes in `node.gke.io/last-applied-node-labels`), read from the instance object already in hand, so there is no extra API call and no change to `pkg/metadata`; only that item is read and the rest of the metadata, which carries `kube-env`, is never retained. `karpenter.sh/registered` and `karpenter.sh/initialized` are **removed at write time**: core adds them when registration completes, their absence before that is the signal core's race protection relies on, and core copies NodeClaim annotations onto the Node during registration. One producer and one record mean the controller needs no Compute metadata read, does not depend on the instance still being readable, and never touches `kube-env`. The controller treats the annotation as untrusted input: it parses it strictly (every key and value must be a valid label), applies the label policy below, and bounds its size (16 KiB). A claim without a usable annotation gets one `NodeCreationSkipped` event and is replaced at the registration timeout, which is what happens today on a `VIA_CONTROL_PLANE` cluster. That covers claims launched by an older version, a VM without a `kube-labels` item, and a VM that an earlier `Create` attempt launched and a retry adopted: adoption does not recover the labels, because supporting it would need a metadata parser for a case that is rare and no worse than the status quo. The annotation (about 1 KB) reaches every Karpenter Node in every mode, because core syncs annotations; that cost is accepted. A VM that disappears between enrollment and creation is no longer detected by the controller; the Node it would create is an orphan removed by core's NodeClaim garbage collection and the cloud controller manager, the same cleanup as for any VM lost after registration.
-- **Taints** are recomputed with the same functions used at launch: the fixed `karpenter.sh/unregistered=true:NoExecute`, GPU taints (`gpuInstanceMetadata`) derived from the NodeClaim and its NodeClass, plus `node.cloudprovider.kubernetes.io/uninitialized=true:NoSchedule`. NodeClaim taints and startup taints are applied by core at registration. Launch-time and creation-time NodeClass drift between the two is the same exposure as for any NodeClass edit and is surfaced by existing drift detection.
-- `metadata.name`: instance name (matches the kubelet's `CN=system:node:<name>`).
-- `spec.providerID`: `gce://<project>/<zone>/<name>`.
-- `metadata.annotations`: `karpenter.k8s.gcp/created-by: nodecreation-controller` for diagnostics; neither core registration nor the kubelet removes unknown annotations.
-- No owner references or finalizers. Core registration adds them. Until then the Node has no core termination finalizer, so cleanup of a claim deleted before registration depends on core's NodeClaim finalizer (deletes Nodes by `providerID`) and, for the narrow create-versus-delete race that a re-read cannot make atomic, on the cloud controller manager's lifecycle controller removing Nodes whose instance is gone. This is relied upon and tested, not assumed.
+- **Terraform** (`deploy/terraform`, `deploy/terraform-e2e`): optional `min_master_version` (a floor, validated) and `node_creation_mode` inputs; `google` provider 6.28.0 to 7.46.2 (the field needs 7.36.0 or later). The shared e2e config uses `REGULAR` (STABLE does not offer 1.37 yet), `min_master_version = "1.37"` and pins `VIA_CONTROL_PLANE`, so a flip of GKE's default cannot silently change the environment. Re-run the read-only `terraform plan` before any apply; applying is a separate live operation.
+- **Specs** (`test/suites/provisioning/node_creation.go`, `suite:provisioning`, run by `standard`): one registration spec per mode, each skipping unless the cluster's reported mode matches (it fails instead of skipping while a cluster operation runs, because the mode is stale then), and a mode-independent deletion-before-registration spec. A registration spec asserts: the claim's Node is Ready within 5 minutes of claim creation with no replacement claim; `registered`/`initialized`; GKE readiness labels match a MIG node of the same cluster; every kube-system DaemonSet meant for the node has a Ready pod; and the `created-by` annotation is present in `VIA_CONTROL_PLANE` and absent in `VIA_KUBELET`. The deletion spec checks the claim is still unregistered before deleting its pool and leaves no Node or VM.
+- On a timeout the spec dumps NodeClaim conditions, CSRs and their approver, Node events and the cluster mode. The runner report gains an `Environment` line (Kubernetes version, node creation mode). The channel image spec skips when a channel has no version for the cluster's minor.
+- **Validation**: `make e2e-deploy` and `make e2e-tests E2E_SELECTION=standard GINKGO_PROCS=20` from the branch under test; results are reported on #803. Re-run in `VIA_CONTROL_PLANE` for releases and for PRs touching registration, CSR approval, bootstrap metadata or instance creation. Continuous coverage of both modes needs a second environment or switching one cluster between runs, which is not designed here. A scheduled canary on a throwaway cluster without the mode set would be the only way to observe the day the default flips; release-note review (`gke-release-notes-review`) is the cheap alternative.
 
-**Node deletion.** The provider never deletes Nodes and this proposal adds no deletion code. Ownership by phase:
-
-| Phase                                                                                    | Who removes the Node                                                                                                                                                                                                     | Status                                                               |
-|------------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------|
-| Registered, NodeClaim deleted (consolidation, expiry, drift, NodePool or claim deletion) | Core Karpenter. Registration adds the `karpenter.sh/termination` finalizer and the NodeClaim owner reference to the controller-created Node; core's termination flow drains it, deletes the VM and removes the finalizer | Verified live (below)                                                |
-| NodeClaim deleted before registration                                                    | Core's NodeClaim finalizer deletes Nodes by `providerID`; the CCM lifecycle controller covers the create-versus-delete race                                                                                              | Relied upon; covered by the deletion spec, not yet run               |
-| Registered Node whose VM disappears outside Karpenter (preemption, manual delete)        | Expected: core NodeClaim garbage collection and/or the CCM lifecycle controller                                                                                                                                          | **Not verified in `VIA_CONTROL_PLANE`** (open question 6)            |
-| Healthy registered Node                                                                  | Nothing; GKE does not delete a Node it did not create while its VM runs                                                                                                                                                  | Sampled stable for about 10 minutes, until the NodeClaim was deleted |
-
-Live check (2026-11-25), on the shared e2e cluster in `VIA_CONTROL_PLANE` (control plane 1.37.1-gke.1552000) running this branch: the provider created the Node, which the kubelet adopted; the NodeClaim reached `Registered`, `Initialized` and `Ready`, and the Node carried the finalizer and owner reference. The Node kept its UID and stayed `Ready` with no `deletionTimestamp` in samples taken for about 10 minutes while its VM ran. Deleting the NodeClaim, with a workload pod bound to the node, removed the Node and the VM within 93 s with no provider involvement. The out-of-band VM deletion row was not exercised. If it shows that nothing removes such a Node, the follow-up is a provider-side reconcile that deletes a controller-created Node whose instance is gone, limited to Nodes carrying `karpenter.k8s.gcp/created-by` and no longer backed by a NodeClaim; until then no such code is justified.
-
-**Why the `kube-labels` set and not `--node-labels`.** The provider maintains both sets and they deliberately differ: `kube-labels` also carries labels GKE applies through a trusted component and that a kubelet is not allowed to set, such as `cloud.google.com.node-restriction.kubernetes.io/gke-secondary-boot-disk-*` (written only via `SetKubeLabel`) and `karpenter.sh/registered`. `--node-labels`, the kubelet's own registration set, is therefore not a complete picture. The annotation carries the `kube-labels` set, so no secret-bearing `kube-env` parsing is needed either.
-
-**Label policy.** The controller is a trusted control plane component like `gcp-controller-manager`, so it may set `*.node-restriction.kubernetes.io` labels that a kubelet cannot. It must still never be more permissive than the data's trust boundary: keys come only from the provider-written annotation. Keys in the `kubernetes.io` and `k8s.io` namespaces other than those a kubelet may self-assign (`kubernetes.io/{hostname,arch,os}`, `node.kubernetes.io/*`, `topology.kubernetes.io/{region,zone}`, legacy `failure-domain.beta.kubernetes.io` and `beta.kubernetes.io` equivalents, `kubelet.kubernetes.io/*`) are dropped and logged once per claim; `node-role.kubernetes.io/*` is among the dropped. The annotation is writable by anyone who can patch NodeClaims, the same boundary as the enrollment annotation that gates creation, and the filter stops it from setting reserved keys, so the filter is defense in depth, not a new boundary. The controller no longer depends on VM metadata, which anyone with `compute.instances.setMetadata` can edit. Whether GKE also reconciles `kube-labels` onto an adopted Node is unknown (open question 2); the controller setting them is harmless either way because it applies the same values.
-
-#### 5. RBAC and IAM
-
-- Chart `clusterrole-core.yaml`: add `create` to the existing `nodes` write rule (today `delete`, `update`, `patch`). No other Kubernetes permission is new. `deploy/iam/karpenter-controller-role.yaml` needs no change: `compute.instances.get` is already required.
-- The controller never uses node credentials; node identity gains nothing, preserving the point of control plane node creation.
-
-#### 6. Observability
-
-- Events on the NodeClaim: `NodeCreatedByController`, `NodeCreationSkipped` (with reason), `NodeCreationModeMismatch`, `NodeNameCollision`.
-- Metric `karpenter_gcp_nodecreation_total{result="created|exists|collision|error"}`.
-- Startup and mode-change log lines; a clear error log, once per claim, when a claim is launched, enrolled, unregistered past the grace period and the setting is `kubelet`.
-- Docs: supported modes and GKE versions, the `nodeCreation` setting, troubleshooting (`Registered=Unknown NodeNotFound`, kubelet `NodeRegistrationCheckerStart` events, CSR approved but no Node).
-
-#### 7. Kubernetes version guard
-
-`MaxK8sVersion` was `1.36.99`, which logged an ERROR on every 1.37 cluster at startup. This PR raises it to `1.37.99`: Karpenter was run on 1.37.1-gke.2097000 in `VIA_KUBELET` mode and provisioned, registered and ran workloads, and the shared e2e cluster moves to 1.37 with this PR. The full suites have not yet run on 1.37; that run is the first validation after the Terraform is applied.
-
-#### 8. E2E and infrastructure prerequisites
-
-Delivered with this proposal so the fix can be validated on a 1.37 cluster:
-
-- `deploy/terraform` gains `min_master_version` (optional, validated, passed to `google_container_cluster.min_master_version`). It is a floor; GKE keeps auto-upgrading inside the release channel, which must offer the version. The e2e root passes it through and the shared `terraform.tfvars` sets `release_channel = "REGULAR"` and `min_master_version = "1.37"` because `STABLE` does not yet offer 1.37. The module also gains `node_creation_mode` (`VIA_KUBELET` or `VIA_CONTROL_PLANE`, rendered as `node_creation_config`), the `google` provider moves from 6.28.0 to 7.46.2 (the field needs 7.36.0 or later), and the shared e2e config pins `VIA_CONTROL_PLANE` explicitly. A read-only `terraform plan` (no lock, nothing applied) against the shared state with `node_creation_mode = "VIA_KUBELET"` showed exactly two in-place cluster changes and nothing else: `min_master_version` set to `1.37` and `release_channel` `STABLE` to `REGULAR`, so the provider bump itself causes no drift and `VIA_KUBELET` matched the live mode. With the pin now `VIA_CONTROL_PLANE` the plan is expected to add a third change, `node_creation_config`; re-run the plan to confirm before applying. Applying it is a separate, explicitly approved live operation that upgrades the control plane and switches the mode; see section 9.
-- The channel image-selection spec skips itself when the selected channel offers no version for the cluster's Kubernetes minor. `ResolveVersionForChannel` exposes `ErrNoVersionForClusterMinor`; the e2e helper `SkipIfChannelLacksClusterMinor` skips only on that error, so other resolution failures still fail the spec.
-
-The control-plane validation run and its specs are designed in section 9.
-
-#### 9. E2E validation design
-
-**Goal.** Prove at least once, and then keep proving, that the provider provisions working nodes when the cluster uses control plane node creation, so a GA or default flip by GKE cannot silently break users. The shared config pins the persistent e2e cluster to `VIA_CONTROL_PLANE`; until it is applied, the live cluster is `VIA_KUBELET` and every suite runs only there.
-
-**Principles.**
-
-- Pin the mode explicitly in the e2e Terraform. A cluster that relies on the GKE default changes behavior silently the day the default flips, including when it is recreated. The shared config pins `VIA_CONTROL_PLANE` in this PR.
-- Use the existing tooling unchanged. `make e2e-deploy`, `e2e-tests` and the runner already target one cluster and derive every name from `E2E_PREFIX`.
-- Show red before green: run the specs against current `main` on a `VIA_CONTROL_PLANE` cluster to demonstrate that they detect the bug, then against the fix.
-
-**Environment.** The validation uses the shared persistent cluster. This PR sets `node_creation_mode = "VIA_CONTROL_PLANE"` in `deploy/terraform-e2e/terraform.tfvars`; applying it (an explicitly approved live operation, together with the channel and 1.37 floor changes in this PR) switches the cluster. The change affects only nodes created afterwards, and `clusters.get` keeps reporting the old mode until the cluster operation finishes, so confirm the mode after the cluster returns to `RUNNING`; the new specs enforce that. While the cluster is in `VIA_CONTROL_PLANE`, current `main` cannot register nodes, so other branches' runs are red until the provider fix lands or the owner switches back to `VIA_KUBELET`; timing the apply is the owner's call. No second cluster, state, or Terraform guard change is part of this proposal.
-
-**Infrastructure changes (`deploy/terraform`, `deploy/terraform-e2e`), done in this PR.** `node_creation_mode` input on the cluster module and the e2e root, `google` provider 7.46.2 (the field needs 7.36.0 or later), the shared config pinned to `VIA_CONTROL_PLANE`. The read-only plan described in section 8 predates this pin and showed the `VIA_KUBELET` baseline; re-run it before applying.
-
-**Validation run.**
-
-1. Apply the shared config (`node_creation_mode = "VIA_CONTROL_PLANE"`); wait for `RUNNING` plus the new reported mode.
-2. `make e2e-deploy` and `make e2e-tests E2E_SELECTION=standard GINKGO_PROCS=20`, from the branch under test. The runner lease is per cluster.
-3. Switch back to `VIA_KUBELET` when done, unless the fix is merged.
-
-This is what was done by hand, with a `gcloud` flip on a temporary cluster, for the evidence in this proposal.
-
-**Coverage of both modes afterwards.** Running both modes continuously needs two environments (a second cluster with its own prefix and state) or switching one cluster between runs. Neither is designed here; it can be revisited once control plane creation is the default, since `VIA_KUBELET` would then be the mode needing a pinned environment. The specs self-skip, so the same suites run unchanged on either.
-
-**Optional: default-flip canary.** A scheduled job creates a throwaway cluster **without** specifying the mode on the newest RAPID version, records the mode GKE chose, runs the registration spec below, and tears the cluster down. It is the only check that observes what the default actually is on the day it changes, independent of any pinned environment. Release-note review (`gke-release-notes-review`) is the cheap alternative.
-
-**Test changes.**
-
-- `Environment.NodeCreationMode(ctx)` in `test/pkg/environment`, from the GKE cluster read the environment already has access to; it is logged at suite start and used by specs to pick assertions.
-- New specs in `test/suites/provisioning/node_creation.go` (committed with this proposal, labelled `suite:provisioning` so `standard` runs them). One registration spec per mode, each skipping itself unless the cluster's reported mode matches (`Environment.SkipUnlessNodeCreationMode`; it fails instead of skipping while a cluster operation is running, because the reported mode is stale then), plus a mode-independent deletion spec. The registration specs share this body:
-  1. Provision a node and assert Ready within a bound that detects churn (for example 5 minutes, well below the 15-minute registration TTL), `karpenter.sh/registered` and `initialized`, the NodeClaim `Registered` condition.
-  2. Assert GKE readiness labels: every key from a fixed list of GKE readiness labels (for example `addon.gke.io/node-local-dns-ds-ready`, `iam.gke.io/gke-metadata-server-enabled`, `cloud.google.com/gke-netd-ready`) that exists on a GKE-managed node of the same cluster also exists on the Karpenter node. This is the label diff against a MIG node required by the Test Plan.
-  3. Assert GKE system DaemonSets are Ready on the node (`netd`/`anetd`, `gke-metadata-server`, `gke-metrics-agent`, `pdcsi-node`), the check that caught the missing `uninitialized` taint.
-  4. Mode-specific: in `VIA_CONTROL_PLANE`, assert the Node carries `karpenter.k8s.gcp/created-by`; in `VIA_KUBELET`, assert the annotation is absent. On current `main` the control-plane spec is the expected red result and the kubelet spec passes.
-  5. Delete the NodePool before the node is Ready and assert no Node or VM is left (the creation-versus-delete race).
-- On a registration timeout the spec dumps a diagnostic bundle instead of a bare timeout: NodeClaim conditions, CSRs for the instance (state and approver), Node events, `NodeRegistrationChecker` events, and the cluster's mode. This is exactly the evidence that took manual work to collect here.
-- Runner report (`hack/e2e-runner`) gains an `Environment` line with Kubernetes version and node creation mode, read from the GKE API using the `PROJECT_ID`, `CLUSTER_NAME` and `CLUSTER_LOCATION` the runner already receives, so a report can never be mistaken for the wrong profile.
-- Existing suites run unchanged in either mode. No spec deletes Node objects or restarts kubelets today (checked by search), so no existing spec is expected to depend on kubelet self-registration; the first control-plane run confirms it.
-
-**Run order and acceptance.**
-
-1. Validation run against current `main`: expect the new spec to fail with the diagnostic bundle (red), and the rest of the suites to fail at registration. This proves the harness detects the issue.
-2. Validation run against the Phase 3 branch: the full `standard` selection passes (green), with the report showing the cluster's mode and Kubernetes minor.
-3. Re-run in `VIA_CONTROL_PLANE` for releases and for any PR that touches registration, CSR approval, bootstrap metadata or instance creation, until both modes have continuous coverage.
-
-**Cost and limits.** No new infrastructure: the validation reuses the shared cluster. Flipping the mode takes 4 to 15 minutes. GPU and extended local SSD stay outside `standard` as today.
+---
 
 ## Risks and Mitigations
 
-| Risk                                                                                                                                                                                                                     | Likelihood    | Impact                       | Mitigation                                                                                                                                                                                                                                 |
-|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|---------------|------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| The mechanism rests on one observation (kubelet `Create` on an existing Node reaches adoption on 1.37.1) and is not a documented GKE contract; a stricter admission plugin could reject before the `AlreadyExists` check | Low to medium | High (feature stops working) | Say so in the docs; acceptance requires the e2e spec to pass on every GKE minor claimed as supported; raise it with Google (open question 1); events and metric make failure visible; `kubelet` setting and Phase 1 diagnostics still work |
-| Created Node is incomplete versus a GCM-created Node (labels/annotations GKE expects)                                                                                                                                    | Medium        | Medium                       | Labels taken from the claim's `node-labels` annotation, written from the launched VM's `kube-labels` item; e2e diffs labels against a MIG node in the same cluster and asserts every GKE DaemonSet becomes Ready                           |
-| Mode misreported during a flip                                                                                                                                                                                           | Medium        | Low                          | Forced cluster-config refresh plus grace-period fallback, mismatch event                                                                                                                                                                   |
-| Early creation in `VIA_KUBELET` mode races a healthy kubelet                                                                                                                                                             | Low           | Low (adoption path)          | Grace measured from enrollment (kubelet registered ~1 s after cert in observed runs); explicit e2e case                                                                                                                                    |
-| Controller privilege increase (`nodes: create`)                                                                                                                                                                          | Low           | Medium                       | Narrow create path (enrolled, launched, provider-owned claims only), negative e2e test, security docs                                                                                                                                      |
-| Label trust: controller-created Node bypasses `NodeRestriction`                                                                                                                                                          | Low           | Medium                       | Keys only from the provider-written NodeClaim annotation, kubelet-equivalent filter for `kubernetes.io`/`k8s.io` keys, same trust boundary as the enrollment annotation                                                                    |
-| Orphan or duplicate Node (claim deleted mid-creation, recycled name, stale Node with the same providerID)                                                                                                                | Low           | Medium                       | Re-read claim before create, `NodeForNodeClaim` providerID check before create, no finalizers or owner refs until core registers, CCM lifecycle controller as safety net, tests for each case                                              |
-| Overlap with the CSR attestation changes (#795)                                                                                                                                                                          | Medium        | Low                          | The CSR controller owns and writes the enrollment annotation; this proposal never re-implements CSR authorization                                                                                                                          |
+| Risk                                                                                              | Likelihood    | Impact                       | Mitigation                                                                                                                                                                         |
+|---------------------------------------------------------------------------------------------------|---------------|------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Adoption of a pre-existing Node rests on one observation on 1.37.1, not a documented GKE contract | Low to medium | High (feature stops working) | Documented as such; e2e on every supported minor; raise with Google (question 1); events and metric expose failure; `kubelet` setting still restores today's behavior              |
+| Created Node is incomplete versus a GCM-created one                                               | Medium        | Medium                       | Labels from the launched VM's `kube-labels`; e2e diffs against a MIG node and requires every GKE DaemonSet Ready                                                                   |
+| Mode misreported during a flip                                                                    | Medium        | Low                          | Forced config refresh, grace fallback, mismatch event                                                                                                                              |
+| Early creation races a healthy kubelet in `VIA_KUBELET`                                           | Low           | Low (adoption path)          | Grace measured from enrollment; explicit e2e case                                                                                                                                  |
+| Privilege increase (`nodes: create`) and label trust (bypasses `NodeRestriction`)                 | Low           | Medium                       | Create only for enrolled, launched, provider-owned claims; kubelet-equivalent label filter; annotation has the same trust boundary as the enrollment annotation; negative e2e test |
+| Orphan or duplicate Node (claim deleted mid-creation, recycled name, same `providerID`)           | Low           | Medium                       | Re-read claim before create; `providerID` check before create; no finalizer until core registers; CCM and core GC as safety net; tests for each case                               |
+| Overlap with CSR attestation (#795)                                                               | Medium        | Low                          | The CSR controller owns the enrollment annotation; this feature never re-implements CSR authorization                                                                              |
 
 ---
 
@@ -245,120 +143,61 @@ This is what was done by hand, with a `gcloud` flip on a temporary cluster, for 
 
 ### Unit Tests
 
-- `NodeCreationMode`: nil config, `VIA_KUBELET`, `VIA_CONTROL_PLANE`, unknown value, API error, cache and invalidation.
-- `node-labels` annotation: written from the launched VM's `kube-labels` item, never containing `karpenter.sh/registered` or `initialized`, absent when the item is missing or malformed; in the controller, missing, malformed, oversized and reserved-key input, each reported once per claim.
-- Which keys may differ between the `kube-labels` set and `--node-labels` (secondary-boot-disk `*.node-restriction.kubernetes.io` label, `karpenter.sh/registered`), asserted explicitly.
-- Enrollment annotation written by the CSR controller only on a successful approval for a launched, unregistered, provider-owned claim.
-- Controller eligibility table: non-provider claim, not launched, deleting, registered, no enrollment annotation, Node exists by providerID, a differently named Node with the same providerID, mode gate, `nodeCreation` values, grace boundaries measured from enrollment, forced refresh.
-- Rendered Node: `uninitialized` and `unregistered` taints present, GPU taints, `registered` label absent, secondary-boot-disk label kept, `node-role.kubernetes.io/*` and other unsafe keys dropped, providerID format, `AlreadyExists` with matching and mismatching providerID, no finalizer or owner reference.
-- `ResolveVersionForChannel` error matches `ErrNoVersionForClusterMinor` and nothing else does.
+- `NodeCreationModeOf`: nil config, both modes, unknown value, API error, cache and invalidation.
+- `Create` writes `node-labels` from the launched VM's `kube-labels`, without `registered`/`initialized`, and writes nothing when the item is absent.
+- Controller eligibility: non-provider claim, not launched, deleting, registered, no enrollment, Node exists by `providerID`, differently named Node with the same `providerID`, mode gate, `nodeCreation` values, grace boundaries from enrollment, forced refresh.
+- Annotation handling: missing, malformed, invalid label, oversized (each reported once per claim). Rendered Node: both taints, GPU taints, `registered` label absent, secondary-boot-disk label kept, unsafe keys dropped, `AlreadyExists` with matching and mismatching `providerID`, no finalizer or owner reference.
+- The CSR controller writes the enrollment annotation only on a successful approval of a launched, unregistered, provider-owned claim.
 
-### E2E / Integration Tests
+### E2E
 
-- `VIA_CONTROL_PLANE` cluster: launch, registration, `karpenter.sh/registered`/`initialized`, GKE readiness labels, GPU, local-SSD and secondary-boot-disk labels, label diff against a MIG node, CSR approval and certificate rotation, termination, no leaked Nodes.
-- Claim deleted before registration: Node removed (core finalizer path and CCM safety net), no orphan.
-- Registered node whose VM is deleted out of band: Node and NodeClaim removed, and by whom (audit log); the first run settles open question 6.
-- Negative: no Node is created for a non-provider claim or an unenrolled claim.
-- `VIA_KUBELET` cluster regression: unchanged timing and no controller-created Nodes (annotation absent); a forced early-creation case.
-- Flip test (manual or nightly): `KUBELET` to `CONTROL_PLANE` mid-run exercises the fallback.
-- The spec runs on every GKE minor the docs claim to support.
+- `VIA_CONTROL_PLANE`: launch, registration, GKE readiness labels, label diff against a MIG node, DaemonSets, termination, no leaked Nodes; GPU, local-SSD and secondary-boot-disk labels; certificate rotation.
+- Claim deleted before registration leaves no Node or VM. Registered node with a VM deleted out of band: Node and NodeClaim removed, and by whom (audit log); settles question 6.
+- No Node for a non-provider or unenrolled claim.
+- `VIA_KUBELET` regression: unchanged timing, no controller-created Nodes, a forced early-creation case. A `KUBELET` to `CONTROL_PLANE` flip mid-run exercises the fallback.
 
 ---
 
 ## Acceptance Criteria
 
-The feature is complete when:
-
-- [ ] A NodePool on a `VIA_CONTROL_PLANE` cluster provisions nodes that become Ready and run pods, including GKE system DaemonSets.
-- [ ] `VIA_KUBELET` behavior and timings are unchanged and covered by the existing suites.
-- [ ] `nodeCreation: kubelet` restores today's behavior exactly.
-- [ ] Events, metric and logs identify a stuck registration and its likely cause.
-- [ ] Docs list supported modes/GKE versions, the setting, troubleshooting, the `nodes: create` privilege, and state that the mechanism is not a documented GKE contract; chart README updated.
-- [ ] e2e runs the suites on a 1.37 cluster in both modes and on every supported minor; `MaxK8sVersion` revisited.
+- [X] A NodePool on a `VIA_CONTROL_PLANE` cluster provisions nodes that become Ready (verified manually on 1.37.1; full suite run reported on #803).
+- [ ] `VIA_KUBELET` timings are unchanged and covered by the existing suites.
+- [X] `nodeCreation: kubelet` restores today's behavior.
+- [X] Events, metric and logs identify a stuck registration and its cause.
+- [X] Docs cover modes, the setting, troubleshooting, the `nodes: create` privilege and that adoption is not a documented GKE contract; chart README updated.
+- [ ] e2e runs the suites on a 1.37 cluster in both modes and on every supported minor.
 - [ ] A support request to Google about non-MIG VMs under control-plane node creation is filed and linked.
-
----
-
-## Implementation Phases
-
-Phases 0 to 3 are implemented together in #803, so the validation run of Phase 4 can exercise the whole path. They are described separately because each is shippable and reviewable on its own.
-
-### Phase 0 - Validation prerequisites (with this proposal)
-
-`min_master_version` in Terraform; the channel image-selection spec skips when the channel lacks the cluster minor.
-
-### Phase 1 - Detection and visibility
-
-`NodeCreationMode`, startup and mode-change logging, a clear error and event for launched, unregistered claims past the registration grace in `VIA_CONTROL_PLANE`, docs stating the limitation. Shippable alone: it turns silent 15-minute churn into an actionable message.
-
-### Phase 2 - Enrollment record
-
-The CSR controller records `karpenter.k8s.gcp/kubelet-enrolled-at` on the NodeClaim. Coordinate with #795.
-
-### Phase 3 - Node creation
-
-`node-labels` annotation written by `Create`, the `nodecreation` controller, `nodeCreation` setting, RBAC `nodes: create`, metrics, events, security docs.
-
-### Phase 4 - Validation and rollout
-
-The `registration` spec and diagnostics, the `MaxK8sVersion` update and the migration note are part of #803. Still to do: the control-plane validation run (section 9), release notes. Decide, from data, whether always creating the Node in every mode should replace mode detection (see Alternatives).
 
 ---
 
 ## Migration
 
-No action on `VIA_KUBELET` clusters. Operators on `VIA_CONTROL_PLANE` clusters upgrade the chart; the RBAC rule `nodes: create` is part of the chart. Operators who manage the ClusterRole themselves must add `create` for `nodes`. `nodeCreation: kubelet` restores the previous behavior.
+No action on `VIA_KUBELET` clusters. On `VIA_CONTROL_PLANE` clusters, upgrade the chart, which includes `nodes: create`; operators who manage the ClusterRole themselves must add it. `nodeCreation: kubelet` restores the previous behavior. NodeClaims launched before the upgrade have no `node-labels` annotation and are replaced at the registration timeout.
 
 ---
 
 ## Alternatives Considered
 
-### Always create the Node, in every mode
-
-Removes mode detection and flip races, and exercises one path. Rejected for the first release: it changes registration for every existing cluster, and `--node-labels` are not applied to a pre-existing Node, so any label the provider fails to reproduce would regress healthy clusters. Phase 4 revisits this once data exists.
-
-### Create the Node inside `CloudProvider.Create`
-
-Simple, but couples VM launch to Kubernetes writes before the kubelet has authenticated and breaks the invariant that a Node follows an authenticated kubelet. A separate controller is idempotent, retryable and testable.
-
-### Create the Node when the NodeClaim is created or launched
-
-Saves the wait for enrollment, but creates Nodes for VMs that never boot or enroll and widens the create-versus-delete race to the whole boot, so more cleanup falls on core's finalizer and the CCM. Rejected for the reasons given under section 3; the enrollment wait was about one second in the live run.
-
-### Use the core `NodeLifecycleHook`
-
-The hook only gates when registration completes; it cannot create the Node.
-
-### Recompute the labels, read them back from the VM, parse `kube-env`, or use NodeClaim labels
-
-- **Recompute from the NodeClass and NodeClaim.** Can diverge from the launched VM: inherited readiness labels vary by source pool, and the template can change between launch and Node creation.
-- **Read the VM's `kube-labels` item back when creating the Node (an earlier revision of this proposal).** Faithful by construction, but the information is already in hand at launch. It adds a Compute metadata read and parsing to the controller, an error path for a missing or malformed item, a dependency on the instance being readable, and trust in `compute.instances.setMetadata` writers. The annotation reads the same item once, at launch or adoption, from the instance object already fetched.
-- **Parse `KUBELET_ARGS` from `kube-env`.** Secret-bearing (kubelet credentials live in the same item) and omits `kube-labels`-only labels.
-- **Put the labels in `NodeClaim.metadata.labels`.** Core copies NodeClaim labels onto the Node at registration in every mode, so `VIA_KUBELET` clusters would gain labels a kubelet cannot set and that GKE reconciles itself, violating the unchanged-behavior goal. `karpenter.sh/registered` would reach the Node before registration finishes unless stripped. Behavior for restricted keys on NodeClaim labels is unverified, and about 20 GKE-internal labels would sit on every claim. This fits Phase 4 ("always create the Node"), where core would own label sync in every mode by intent.
-
-### Wait for Google to support non-MIG VMs
-
-Unknown timeline and mechanism. Pursued in parallel (open question 1), but users on default-CP clusters need a working path now.
-
-### Block provisioning on `VIA_CONTROL_PLANE`
-
-Cheap, and shipped as Phase 1 for visibility, but it leaves the default mode of new clusters unsupported.
+- **Create the Node in every mode.** Removes mode detection and flip races and exercises one path, but changes registration on every existing cluster, and any label the provider fails to reproduce would regress healthy clusters. Revisit once data exists.
+- **Create the Node inside `CloudProvider.Create`, or when the claim is created or launched.** Couples VM launch to Kubernetes writes before the kubelet authenticated, creates Nodes for VMs that never boot, and widens the create-versus-delete race to the whole boot. A separate controller is idempotent, retryable and testable.
+- **Core `NodeLifecycleHook`.** It only gates when registration completes; it runs after the Node exists and cannot create it.
+- **Other label sources.** Recomputing from the NodeClass and NodeClaim can diverge from the launched VM (inherited readiness labels vary by source pool). Reading `kube-labels` back from the VM when creating the Node needs a Compute read and parser in the controller and trusts `compute.instances.setMetadata` writers. Parsing `KUBELET_ARGS` from `kube-env` is secret-bearing and omits `kube-labels`-only labels. `NodeClaim.metadata.labels` would make core copy about 20 GKE-internal labels onto every Node in every mode, including `VIA_KUBELET` clusters, and `registered` would reach the Node before registration finishes; it fits the "create in every mode" alternative, where that is intended.
+- **Wait for Google to support non-MIG VMs.** Unknown timeline; users on default-CP clusters need a working path now.
+- **Block provisioning on `VIA_CONTROL_PLANE`.** Cheap, but leaves the default mode of new clusters unsupported.
 
 ---
 
 ## Future Direction
 
-- Drop the `auto` fallback and the setting if Google supports third-party VMs natively.
-- Reuse the controller to tolerate other GKE registration changes.
-- **Sunset criteria.** Remove the controller once GKE supports standalone VMs natively (open question 1 answered) and an e2e run in `VIA_CONTROL_PLANE` registers nodes with `NODE_CREATION=kubelet`. Deprecate the setting for one release first, then delete the controller, the `node-labels` annotation writer, the RBAC `create` verb and the control-plane e2e specs.
+Remove the controller once GKE supports standalone VMs natively (question 1 answered) and an e2e run in `VIA_CONTROL_PLANE` registers nodes with `NODE_CREATION=kubelet`: deprecate the setting for one release, then delete the controller, the `node-labels` annotation writer, the RBAC `create` verb and the control-plane e2e specs. Decide from data whether creating the Node in every mode should replace mode detection.
 
 ---
 
 ## Open Questions
 
-1. **Supported path from Google**: does `gcp-controller-manager` support standalone VMs in control-plane mode, or will admission eventually restrict other Node creators or reject a kubelet `Create` before the `AlreadyExists` check? Open; to be raised with GKE support.
-2. **Label reconciliation**: GKE documents that labels and annotations can lag Node creation. Does GKE reconcile `kube-labels` (including `*.node-restriction.kubernetes.io` labels) onto an adopted Node, and when? In the manual proof of concept some labels (disk-type, cluster location) appeared on an adopted Node that the author had not set, while kubelet `--node-labels` were not applied. Open; e2e must assert ordering and a diff against a MIG node.
-3. **Certificate rotation in control-plane mode**: `system:node:<name>` renewal CSRs were not exercised. Open.
+1. **Supported path from Google**: does `gcp-controller-manager` support standalone VMs in control-plane mode, or could admission later restrict other Node creators or reject a kubelet `Create` before the `AlreadyExists` check? To be raised with GKE support.
+2. **Label reconciliation**: does GKE reconcile `kube-labels` (including node-restriction labels) onto an adopted Node, and when? In the manual proof of concept some labels (disk-type, cluster location) appeared that the author had not set. The e2e label diff covers it.
+3. **Certificate rotation**: `system:node:<name>` renewal CSRs in control-plane mode were not exercised.
 4. **Grace period**: 45 s from enrollment is based on observed timing; tune after e2e data.
-5. **Reported default**: new 1.37.2 clusters were `VIA_KUBELET` despite the release note. Re-verify after the release note's version threshold is broadly rolled out.
-6. **Out-of-band VM deletion**: when the VM of a registered, controller-created Node is deleted outside Karpenter, does core NodeClaim garbage collection or the CCM lifecycle controller remove the Node in `VIA_CONTROL_PLANE`? Not yet tested; see section 4, Node deletion. Decides whether provider-side deletion handling is needed.
+5. **Reported default**: new 1.37.2 clusters were `VIA_KUBELET` despite the release note; re-verify once the release note's version threshold is broadly rolled out.
+6. **Out-of-band VM deletion**: for a registered, controller-created Node whose VM is deleted outside Karpenter, does core garbage collection or the CCM lifecycle controller remove the Node in `VIA_CONTROL_PLANE`? Decides whether provider-side deletion handling is needed.

@@ -45,6 +45,8 @@ Choose Karpenter when extensibility and infrastructure control matter:
 
 GKE ComputeClasses are a good fit when fully managed GKE integration, especially Autopilot, is the primary goal. For platform teams that expect to customize autoscaling, operate across clouds, or retain deeper control over infrastructure decisions, Karpenter provides the more adaptable foundation. Karpenter Provider for GCP currently targets GKE Standard clusters.
 
+Karpenter can also run in the same cluster as ComputeClasses, node auto-provisioning, and the GKE cluster autoscaler. See [Running alongside GKE autoscaling](docs/gke-autoscaling.md).
+
 ## Managed optimization for production Kubernetes
 
 For teams running Karpenter in production, [CloudPilot AI](https://www.cloudpilot.ai/en/) adds managed cost optimization, reliability automation, deeper cluster visibility, and advanced production features.

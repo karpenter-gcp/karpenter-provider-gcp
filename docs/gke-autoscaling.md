@@ -1,6 +1,6 @@
 # Running alongside GKE autoscaling
 
-Karpenter can run in the same GKE Standard cluster as the GKE cluster autoscaler, node auto-provisioning (NAP), and custom ComputeClasses. A common reason is to keep GKE-managed node pools for accelerators Karpenter doesn't support yet, while Karpenter handles the rest. This page explains how to give each workload to exactly one provisioner.
+Karpenter can share a GKE Standard cluster with the GKE cluster autoscaler, node auto-provisioning (NAP), and custom ComputeClasses. This setup isn't recommended. Depending on your configuration, both provisioners can act on the same pods, and the result is [undefined](#how-the-provisioners-overlap). Run both only when one provisioner can't cover your workloads. For example, you might keep GKE-managed node pools for accelerators Karpenter doesn't support yet. This page explains how to give each workload to exactly one provisioner.
 
 ## How the provisioners overlap
 

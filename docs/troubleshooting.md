@@ -224,7 +224,7 @@ kubectl describe nodeclaim <name>
 - No annotation: the CSR was never approved; see [CSR not approved](#csr-certificate-signing-request-not-approved).
 - A `Node` exists but never becomes Ready, and GKE agents (`anetd`, the metadata server) fail: compare the `Node`'s labels and taints with a GKE-managed node's. A controller-created `Node` carries the annotation `karpenter.k8s.gcp/created-by: nodecreation-controller`.
 
-See [Node creation](settings.md#node-creation) for the setting and its limits.
+See [Node creation](node-creation.md) for the setting and its limits.
 
 ---
 

@@ -12,7 +12,7 @@ To keep the earlier values, set `spec.kubeletConfiguration.kubeReserved` `cpu` a
 
 ### Karpenter creates the Node on GKE control plane node creation clusters
 
-On clusters with `nodeCreationConfig.nodeCreationMode = VIA_CONTROL_PLANE`, GKE does not create a `Node` for Karpenter VMs, so NodeClaims never registered. The controller now creates the `Node` for NodeClaims whose kubelet certificate it approved (`NODE_CREATION=auto`, the default). The chart adds `create` to the `nodes` rule of the core ClusterRole; operators who manage that ClusterRole themselves must add it. `VIA_KUBELET` clusters see no change unless a `Node` is still missing 45 seconds after the approval. Set `controller.settings.nodeCreation=kubelet` to restore the previous behavior exactly. See [Node creation](docs/settings.md#node-creation).
+On clusters with `nodeCreationConfig.nodeCreationMode = VIA_CONTROL_PLANE`, GKE does not create a `Node` for Karpenter VMs, so NodeClaims never registered. The controller now creates the `Node` for NodeClaims whose kubelet certificate it approved (`NODE_CREATION=auto`, the default). The chart adds `create` to the `nodes` rule of the core ClusterRole; operators who manage that ClusterRole themselves must add it. `VIA_KUBELET` clusters see no change unless a `Node` is still missing 45 seconds after the approval. Set `controller.settings.nodeCreation=kubelet` to restore the previous behavior exactly. See [Node creation](docs/node-creation.md).
 
 ### Core node bootstrap follows the selected release, not the source pool
 

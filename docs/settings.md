@@ -154,17 +154,7 @@ Other launch errors keep the NodeClaim and retry with exponential backoff from 1
 
 ### Node creation
 
-GKE can create `Node` objects from its control plane instead of letting the kubelet register itself (`nodeCreationConfig.nodeCreationMode = VIA_CONTROL_PLANE`; the default for new 1.37+ clusters per the GKE release notes, still labeled Preview in the GKE documentation). In that mode GKE does not create a `Node` for a VM outside its own node pools, so a Karpenter VM boots, its kubelet gets a certificate, and no `Node` ever appears. See [proposal 0016](../proposals/0016-control-plane-node-creation.md).
-
-With `NODE_CREATION=auto` (default), Karpenter creates the `Node` itself, but only for a NodeClaim that launched and whose kubelet client certificate the [CSR controller](security/csr-approval.md) approved, so a `Node` still follows an authenticated kubelet. The `Node` carries the labels Karpenter recorded on the NodeClaim when it launched the VM (the set it wrote into the VM's `kube-labels` metadata, in the `karpenter.k8s.gcp/node-labels` annotation), the launch taints and the cloud-initialization taint, and the kubelet adopts it. Karpenter does this immediately when the cluster reports `VIA_CONTROL_PLANE`. On a `VIA_KUBELET` cluster it waits 45 seconds after the approval and then also creates the `Node` if none exists, because GKE keeps reporting the previous mode until a mode change finishes. That fallback emits a `NodeCreationModeMismatch` event on the NodeClaim.
-
-Karpenter waits for the approval rather than creating the `Node` at launch so that a `Node` never exists for a VM that did not boot or whose certificate request was refused, and so that a NodeClaim deleted during boot leaves no `Node` behind. The wait adds about a second after the approval.
-
-Karpenter never deletes a `Node` it created. Once the NodeClaim registers, core Karpenter adds its termination finalizer and owner reference, and deleting the NodeClaim removes the `Node` and the VM through core's normal termination flow, as on any other cluster. A `Node` for a NodeClaim deleted before registration is removed by core's NodeClaim finalizer, with the cloud controller manager as a backstop. Behavior when a registered node's VM is deleted outside Karpenter is not yet verified in `VIA_CONTROL_PLANE` mode; see [open question 6](../proposals/0016-control-plane-node-creation.md#open-questions).
-
-`NODE_CREATION=kubelet` never creates Nodes. On a `VIA_CONTROL_PLANE` cluster the NodeClaim then times out and is replaced, and Karpenter logs an error and emits a `NodeCreationSkipped` event naming the setting.
-
-Creating Nodes needs the `create` verb on `nodes`, which the chart grants; operators who manage the ClusterRole themselves must add it. Karpenter never updates or patches a `Node` it did not just create. The mechanism relies on the kubelet adopting a pre-existing `Node`, which is observed behavior on GKE 1.37, not a documented GKE contract. Related metric: `karpenter_gcp_nodecreation_total{result="created|exists|collision|error"}`; related events: `NodeCreatedByController`, `NodeCreationSkipped`, `NodeCreationModeMismatch`, `NodeNameCollision`.
+With `NODE_CREATION=auto` (default) Karpenter creates the `Node` itself for NodeClaims whose kubelet certificate it approved, which GKE clusters with `VIA_CONTROL_PLANE` node creation need. `kubelet` never creates Nodes. See [Node creation](node-creation.md) for how it works, what the `Node` contains, who deletes it, and permissions.
 
 ### Service account resolution
 

@@ -48,7 +48,7 @@ Karpenter never deletes a `Node` it created.
 
 - Creating Nodes needs the `create` verb on `nodes`. The chart grants it; operators who manage the ClusterRole themselves must add it.
 - The mechanism relies on the kubelet adopting a pre-existing `Node`. That is observed behavior on GKE 1.37, not a documented GKE contract.
-- A NodeClaim without a usable `node-labels` annotation, for example one launched by an older Karpenter version, is skipped with a `NodeCreationSkipped` event and replaced at the registration timeout.
+- A NodeClaim without a usable `node-labels` annotation is skipped with a `NodeCreationSkipped` event and replaced at the registration timeout. That covers claims launched by an older Karpenter version and VMs adopted after an interrupted launch.
 
 ## Observability
 

@@ -18,7 +18,6 @@ package cloudprovider
 
 import (
 	"context"
-	"errors"
 	"testing"
 	"time"
 
@@ -272,12 +271,10 @@ func TestCreateMatchesAdoptedCountOutsideFilteredCandidates(t *testing.T) {
 func TestRecordNodeLabels(t *testing.T) {
 	t.Parallel()
 	c := &CloudProvider{}
-	ctx := context.Background()
-
 	t.Run("records the launched set without the registration labels", func(t *testing.T) {
 		t.Parallel()
 		nc := &karpv1.NodeClaim{}
-		c.recordNodeLabels(ctx, nc, &instance.Instance{KubeLabels: map[string]string{
+		c.recordNodeLabels(nc, &instance.Instance{KubeLabels: map[string]string{
 			"karpenter.sh/nodepool":        "default",
 			"disk-type.gke.io/pd-ssd":      "true",
 			karpv1.NodeRegisteredLabelKey:  "true",
@@ -290,7 +287,7 @@ func TestRecordNodeLabels(t *testing.T) {
 	t.Run("empty set is recorded as an empty value", func(t *testing.T) {
 		t.Parallel()
 		nc := &karpv1.NodeClaim{}
-		c.recordNodeLabels(ctx, nc, &instance.Instance{KubeLabels: map[string]string{}})
+		c.recordNodeLabels(nc, &instance.Instance{KubeLabels: map[string]string{}})
 		value, ok := nc.Annotations[v1alpha1.AnnotationNodeLabels]
 		require.True(t, ok)
 		require.Empty(t, value)
@@ -299,11 +296,10 @@ func TestRecordNodeLabels(t *testing.T) {
 	t.Run("no usable set records nothing", func(t *testing.T) {
 		t.Parallel()
 		for name, inst := range map[string]*instance.Instance{
-			"item absent":    {},
-			"item malformed": {KubeLabelsErr: errors.New("bad label")},
+			"item absent": {},
 		} {
 			nc := &karpv1.NodeClaim{}
-			c.recordNodeLabels(ctx, nc, inst)
+			c.recordNodeLabels(nc, inst)
 			require.NotContains(t, nc.Annotations, v1alpha1.AnnotationNodeLabels, name)
 		}
 	})

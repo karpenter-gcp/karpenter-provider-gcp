@@ -119,7 +119,7 @@ func (c *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 		v1alpha1.AnnotationGCENodeClassHash:        nodeClass.Hash(),
 		v1alpha1.AnnotationGCENodeClassHashVersion: v1alpha1.GCENodeClassHashVersion,
 	})
-	c.recordNodeLabels(ctx, nc, inst)
+	c.recordNodeLabels(nc, inst)
 	return nc, nil
 }
 
@@ -128,12 +128,10 @@ func (c *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 // from. Core copies NodeClaim annotations onto the Node at registration, so the
 // registration labels, which only core may add and whose absence before then is
 // its race protection, are removed here. A VM without a usable set gets no
-// annotation; the controller then skips the claim with an event.
-func (c *CloudProvider) recordNodeLabels(ctx context.Context, nc *karpv1.NodeClaim, inst *instance.Instance) {
-	if inst.KubeLabelsErr != nil {
-		log.FromContext(ctx).Error(inst.KubeLabelsErr, "not recording node labels on the NodeClaim", "instance", inst.Name)
-		return
-	}
+// annotation; the controller then skips the claim with an event. Adopted VMs get
+// none either, so a claim whose VM was created by an earlier attempt is replaced
+// at the registration timeout on clusters where the provider creates the Node.
+func (c *CloudProvider) recordNodeLabels(nc *karpv1.NodeClaim, inst *instance.Instance) {
 	if inst.KubeLabels == nil {
 		return
 	}

@@ -43,15 +43,14 @@ type Instance struct {
 	InstanceTemplate      string            `json:"instanceTemplate"`
 	Labels                map[string]string `json:"labels"`
 	// KubeLabels is the kube-labels metadata item the VM was launched with, the
-	// labels a Node for this instance carries. It is set only by Create and Adopt,
-	// from the instance in hand, and is nil when the instance has no such item or
-	// it is malformed (KubeLabelsErr). No other metadata item is retained.
-	KubeLabels    map[string]string `json:"kubeLabels,omitempty"`
-	KubeLabelsErr error             `json:"-"`
-	Location      string            `json:"location"`
-	Name          string            `json:"name"`
-	ProjectID     string            `json:"projectId"`
-	Status        string            `json:"status"`
-	Tags          map[string]string `json:"tags"`
-	Type          string            `json:"type"`
+	// labels a Node for this instance carries. Only Create sets it, from the
+	// instance it just built; it is nil for adopted and listed instances. No other
+	// metadata item is retained.
+	KubeLabels map[string]string `json:"kubeLabels,omitempty"`
+	Location   string            `json:"location"`
+	Name       string            `json:"name"`
+	ProjectID  string            `json:"projectId"`
+	Status     string            `json:"status"`
+	Tags       map[string]string `json:"tags"`
+	Type       string            `json:"type"`
 }

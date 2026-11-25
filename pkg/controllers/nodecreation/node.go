@@ -23,10 +23,10 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/validation"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 
 	"github.com/karpenter-gcp/karpenter-provider-gcp/pkg/apis/v1alpha1"
-	"github.com/karpenter-gcp/karpenter-provider-gcp/pkg/metadata"
 	"github.com/karpenter-gcp/karpenter-provider-gcp/pkg/providers/instance"
 )
 
@@ -61,9 +61,29 @@ func nodeLabelsOf(nc *karpv1.NodeClaim) (map[string]string, error) {
 	if len(raw) > maxNodeLabelsBytes {
 		return nil, fmt.Errorf("annotation is %d bytes, over the %d byte limit", len(raw), maxNodeLabelsBytes)
 	}
-	labels, err := metadata.ParseLabels(raw)
-	if err != nil {
-		return nil, err
+	return parseLabels(raw)
+}
+
+// parseLabels parses the comma-separated key=value list of the annotation. Every
+// key and value must be a valid Kubernetes label, so a Node built from the result
+// cannot be rejected for a malformed label that was silently skipped.
+func parseLabels(raw string) (map[string]string, error) {
+	labels := map[string]string{}
+	if strings.TrimSpace(raw) == "" {
+		return labels, nil
+	}
+	for _, pair := range strings.Split(raw, ",") {
+		key, value, ok := strings.Cut(strings.TrimSpace(pair), "=")
+		if !ok {
+			return nil, fmt.Errorf("label entry %q is not key=value", pair)
+		}
+		if errs := validation.IsQualifiedName(key); len(errs) > 0 {
+			return nil, fmt.Errorf("label key %q is invalid: %s", key, strings.Join(errs, "; "))
+		}
+		if errs := validation.IsValidLabelValue(value); len(errs) > 0 {
+			return nil, fmt.Errorf("label value of %q is invalid: %s", key, strings.Join(errs, "; "))
+		}
+		labels[key] = value
 	}
 	return labels, nil
 }

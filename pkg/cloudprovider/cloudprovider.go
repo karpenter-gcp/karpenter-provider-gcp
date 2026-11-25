@@ -42,6 +42,7 @@ import (
 	"github.com/karpenter-gcp/karpenter-provider-gcp/pkg/apis/v1alpha1"
 	cloudproviderevents "github.com/karpenter-gcp/karpenter-provider-gcp/pkg/cloudprovider/events"
 	gcperrors "github.com/karpenter-gcp/karpenter-provider-gcp/pkg/errors"
+	"github.com/karpenter-gcp/karpenter-provider-gcp/pkg/metadata"
 	"github.com/karpenter-gcp/karpenter-provider-gcp/pkg/providers/imagefamily"
 	"github.com/karpenter-gcp/karpenter-provider-gcp/pkg/providers/instance"
 	"github.com/karpenter-gcp/karpenter-provider-gcp/pkg/providers/instancetype"
@@ -118,7 +119,26 @@ func (c *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 		v1alpha1.AnnotationGCENodeClassHash:        nodeClass.Hash(),
 		v1alpha1.AnnotationGCENodeClassHashVersion: v1alpha1.GCENodeClassHashVersion,
 	})
+	c.recordNodeLabels(ctx, nc, inst)
 	return nc, nil
+}
+
+// recordNodeLabels stores the kube-labels set the VM was launched with on the
+// returned NodeClaim, the one record the node creation controller builds a Node
+// from. Core copies NodeClaim annotations onto the Node at registration, so the
+// registration labels, which only core may add and whose absence before then is
+// its race protection, are removed here. A VM without a usable set gets no
+// annotation; the controller then skips the claim with an event.
+func (c *CloudProvider) recordNodeLabels(ctx context.Context, nc *karpv1.NodeClaim, inst *instance.Instance) {
+	if inst.KubeLabelsErr != nil {
+		log.FromContext(ctx).Error(inst.KubeLabelsErr, "not recording node labels on the NodeClaim", "instance", inst.Name)
+		return
+	}
+	if inst.KubeLabels == nil {
+		return
+	}
+	labels := lo.OmitByKeys(inst.KubeLabels, []string{karpv1.NodeRegisteredLabelKey, karpv1.NodeInitializedLabelKey})
+	nc.Annotations = lo.Assign(nc.Annotations, map[string]string{v1alpha1.AnnotationNodeLabels: metadata.Labels(labels).String()})
 }
 
 func (c *CloudProvider) applyAdoptedNodeOverlay(ctx context.Context, nodeClaim *karpv1.NodeClaim, instanceType *cloudprovider.InstanceType) (*cloudprovider.InstanceType, error) {

@@ -219,6 +219,7 @@ kubectl describe nodeclaim <name>
 
 - `NodeCreatedByController`: Karpenter created the `Node`; continue with the kubelet and the cloud controller manager.
 - `NodeCreationSkipped` mentioning `NODE_CREATION=kubelet`: set it back to `auto`.
+- `NodeCreationSkipped` mentioning the `karpenter.k8s.gcp/node-labels` annotation: the NodeClaim has no usable label record, typically because it was launched by an older Karpenter version or the VM's `kube-labels` metadata was missing or malformed. Karpenter does not retry; the claim is replaced at the registration timeout.
 - `NodeNameCollision`: a different `Node` already uses the instance name or provider ID; Karpenter leaves it unchanged. Delete the stale `Node` if the instance it describes is gone.
 - No annotation: the CSR was never approved; see [CSR not approved](#csr-certificate-signing-request-not-approved).
 - A `Node` exists but never becomes Ready, and GKE agents (`anetd`, the metadata server) fail: compare the `Node`'s labels and taints with a GKE-managed node's. A controller-created `Node` carries the annotation `karpenter.k8s.gcp/created-by: nodecreation-controller`.

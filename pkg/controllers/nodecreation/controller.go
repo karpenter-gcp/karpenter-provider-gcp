@@ -38,7 +38,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
-	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/events"
 	nodeclaimutils "sigs.k8s.io/karpenter/pkg/utils/nodeclaim"
 
@@ -54,10 +53,9 @@ import (
 // the kubelet registered about a second after its certificate was issued.
 const DefaultGrace = 45 * time.Second
 
-// instanceReader is the part of the instance provider the controller needs.
-type instanceReader interface {
-	Get(ctx context.Context, providerID string) (*instance.Instance, error)
-}
+// maxNodeLabelsBytes bounds the node-labels annotation the controller parses. The
+// set the provider writes is about 1 KB; the bound only limits a hostile edit.
+const maxNodeLabelsBytes = 16 << 10
 
 type Controller struct {
 	kubeClient client.Client
@@ -65,7 +63,6 @@ type Controller struct {
 	// re-check a NodeClaim and an existing Node right before and after creating a
 	// Node, when a stale cache entry would cause a wrong decision.
 	apiReader    client.Reader
-	instances    instanceReader
 	gke          gke.Provider
 	recorder     events.Recorder
 	now          func() time.Time
@@ -83,11 +80,10 @@ type Controller struct {
 // NewController creates the controller. nodeCreation is the operator setting
 // (options.NodeCreationAuto or options.NodeCreationKubelet) and projectID the
 // project whose instances the provider owns.
-func NewController(kubeClient client.Client, instances instanceReader, gkeProvider gke.Provider, recorder events.Recorder, projectID, nodeCreation string) *Controller {
+func NewController(kubeClient client.Client, gkeProvider gke.Provider, recorder events.Recorder, projectID, nodeCreation string) *Controller {
 	return &Controller{
 		kubeClient:   kubeClient,
 		apiReader:    kubeClient,
-		instances:    instances,
 		gke:          gkeProvider,
 		recorder:     recorder,
 		now:          time.Now,
@@ -251,21 +247,19 @@ func (c *Controller) createNode(ctx context.Context, nc *karpv1.NodeClaim, cand 
 	}
 }
 
-// buildNode renders the Node from the instance's kube-labels and the NodeClass. It
-// returns a nil Node and no error when the instance is already gone, which garbage
-// collection and the lifecycle controller handle.
+// buildNode renders the Node from the NodeClaim's node-labels annotation and the
+// NodeClass. It returns a nil Node and no error when the claim cannot be served,
+// which is reported once with an event; retrying would not change the outcome.
 func (c *Controller) buildNode(ctx context.Context, nc *karpv1.NodeClaim, cand candidate) (*corev1.Node, error) {
-	inst, err := c.instances.Get(ctx, cand.providerID)
+	kubeLabels, err := nodeLabelsOf(nc)
 	if err != nil {
-		if cloudprovider.IsNodeClaimNotFoundError(err) {
-			return nil, nil
-		}
-		return nil, c.failed(fmt.Errorf("reading instance %s: %w", cand.nodeName, err))
-	}
-	if inst.KubeLabelsErr != nil || inst.KubeLabels == nil {
-		why := fmt.Sprintf("Instance %s has no usable kube-labels metadata; cannot create its Node", cand.nodeName)
-		c.recorder.Publish(skippedEvent(nc, why))
-		return nil, c.failed(fmt.Errorf("%s: %w", why, inst.KubeLabelsErr))
+		why := fmt.Sprintf("NodeClaim %s has no usable %s annotation (%v); cannot create its Node. A claim launched by an older version is replaced at the registration timeout", nc.Name, v1alpha1.AnnotationNodeLabels, err)
+		c.reportOnce(nc.UID, "node-labels", func() {
+			c.recorder.Publish(skippedEvent(nc, why))
+			log.FromContext(ctx).Error(err, "cannot create Node", "nodeClaim", nc.Name)
+		})
+		nodeCreationTotal.Inc(map[string]string{"result": resultError})
+		return nil, nil //nolint:nilerr // the annotation cannot repair itself, so retrying would only repeat the report
 	}
 
 	var nodeClass v1alpha1.GCENodeClass
@@ -273,10 +267,10 @@ func (c *Controller) buildNode(ctx context.Context, nc *karpv1.NodeClaim, cand c
 		return nil, c.failed(fmt.Errorf("getting GCENodeClass %s: %w", nc.Spec.NodeClassRef.Name, err))
 	}
 
-	node, dropped := renderNode(cand.nodeName, cand.providerID, &nodeClass, inst)
+	node, dropped := renderNode(cand.nodeName, cand.providerID, &nodeClass, kubeLabels)
 	if len(dropped) > 0 {
 		c.reportOnce(nc.UID, "dropped-labels", func() {
-			log.FromContext(ctx).Info("not applying kube-labels a kubelet could not set", "nodeClaim", nc.Name, "labels", dropped)
+			log.FromContext(ctx).Info("not applying node labels a kubelet could not set", "nodeClaim", nc.Name, "labels", dropped)
 		})
 	}
 	return node, nil

@@ -51,9 +51,9 @@ type InstanceMetadata struct {
 	// labels come from kubeEnv.kubeletArgs.nodeLabels. In GKE source templates this
 	// surface appears to contain GKE/bootstrap system labels for metadata readers,
 	// so keep it distinct from both kubelet node labels and GCE instance labels.
-	// The provider's node creation controller reads it back (KubeLabelsFromCompute)
-	// to label a Node it creates, because the kubelet does not apply
-	// --node-labels to a Node that already exists.
+	// The provider records it on the NodeClaim at launch (KubeLabelsFromCompute) so
+	// the node creation controller can label a Node it creates, because the kubelet
+	// does not apply --node-labels to a Node that already exists.
 	kubeLabels Labels
 
 	kubeletConfig kubeletconfig.KubeletConfiguration

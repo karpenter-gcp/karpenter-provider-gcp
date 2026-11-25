@@ -18,8 +18,6 @@ package instance
 
 import (
 	"context"
-	"net/http"
-	"strings"
 	"testing"
 
 	"github.com/samber/lo"
@@ -58,38 +56,27 @@ func TestNodeRegistrationTaints(t *testing.T) {
 	}
 }
 
-func TestGetReturnsOnlyKubeLabelsFromInstanceMetadata(t *testing.T) {
+func TestLaunchedKubeLabelsReadsOnlyTheKubeLabelsItem(t *testing.T) {
 	kubeEnv := "KUBELET_ARGS: --node-labels=a=b\nSECRET_TOKEN: s3cret\n"
-	p := newFakeComputeProvider(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case strings.HasSuffix(r.URL.Path, "/regions/us-central1"):
-			writeJSON(w, &compute.Region{Zones: []string{"https://example/zones/us-central1-a"}})
-		case strings.HasSuffix(r.URL.Path, "/zones/us-central1-a/instances"):
-			writeJSON(w, &compute.InstanceList{Items: []*compute.Instance{
-				{
-					Name: "node-1",
-					Metadata: &compute.Metadata{Items: []*compute.MetadataItems{
-						{Key: "kube-env", Value: lo.ToPtr(kubeEnv)},
-						{Key: "kube-labels", Value: lo.ToPtr("karpenter.sh/nodepool=default,karpenter.sh/registered=true")},
-					}},
-				},
-				{
-					Name:     "node-2",
-					Metadata: &compute.Metadata{Items: []*compute.MetadataItems{{Key: "kube-labels", Value: lo.ToPtr("bad label=x")}}},
-				},
-			}})
-		default:
-			http.NotFound(w, r)
-		}
-	}))
+	p := &DefaultProvider{projectID: "test-project"}
+	gce := func(items ...*compute.MetadataItems) *compute.Instance {
+		return &compute.Instance{Name: "node-1", Zone: "zones/us-central1-a", Metadata: &compute.Metadata{Items: items}}
+	}
 
-	good, err := p.Get(context.Background(), "gce://test-project/us-central1-a/node-1")
-	require.NoError(t, err)
-	require.Equal(t, map[string]string{"karpenter.sh/nodepool": "default", "karpenter.sh/registered": "true"}, good.KubeLabels)
+	good := p.adoptExistingInstance(context.Background(), gce(
+		&compute.MetadataItems{Key: "kube-env", Value: lo.ToPtr(kubeEnv)},
+		&compute.MetadataItems{Key: "kube-labels", Value: lo.ToPtr("karpenter.sh/nodepool=default,karpenter.sh/registered=true")},
+	), "on-demand")
 	require.NoError(t, good.KubeLabelsErr)
+	require.Equal(t, map[string]string{"karpenter.sh/nodepool": "default", "karpenter.sh/registered": "true"}, good.KubeLabels,
+		"only the kube-labels item is read; kube-env is never retained")
 
-	bad, err := p.Get(context.Background(), "gce://test-project/us-central1-a/node-2")
-	require.NoError(t, err)
+	bad := p.adoptExistingInstance(context.Background(), gce(
+		&compute.MetadataItems{Key: "kube-labels", Value: lo.ToPtr("bad label=x")}), "on-demand")
 	require.Nil(t, bad.KubeLabels)
 	require.Error(t, bad.KubeLabelsErr, "a malformed item must be reported, not read as an empty label set")
+
+	none := p.adoptExistingInstance(context.Background(), gce(), "on-demand")
+	require.Nil(t, none.KubeLabels)
+	require.NoError(t, none.KubeLabelsErr)
 }

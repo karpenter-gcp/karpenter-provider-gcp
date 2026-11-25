@@ -443,7 +443,7 @@ func (p *DefaultProvider) adoptExistingInstance(ctx context.Context, existingIns
 	machineType := lastPathSegment(existingInstance.MachineType)
 
 	log.FromContext(ctx).Info("Found existing instance for NodeClaim", "instance", existingInstance.Name, "zone", zone)
-	return &Instance{
+	adopted := &Instance{
 		InstanceID:   existingInstance.Name,
 		Name:         existingInstance.Name,
 		Type:         machineType,
@@ -456,6 +456,19 @@ func (p *DefaultProvider) adoptExistingInstance(ctx context.Context, existingIns
 		Tags:         existingInstance.Labels,
 		Status:       existingInstance.Status,
 	}
+	adopted.KubeLabels, adopted.KubeLabelsErr = launchedKubeLabels(existingInstance)
+	return adopted
+}
+
+// launchedKubeLabels returns the kube-labels set a VM was launched with, read from
+// the instance already in hand at launch or adoption. It reads that one metadata
+// item only: the rest of the metadata carries kube-env and is never retained.
+func launchedKubeLabels(inst *compute.Instance) (map[string]string, error) {
+	labels, _, err := metadata.KubeLabelsFromCompute(inst.Metadata)
+	if err != nil {
+		return nil, err
+	}
+	return labels, nil
 }
 
 // Adopt looks up a VM from an earlier attempt without launching or resolving images.
@@ -564,7 +577,7 @@ func (p *DefaultProvider) createWithCapacityType(ctx context.Context, nodeClass 
 			"zone", zone, "projectID", p.projectID, "region", p.region, "providerID", instance.Name, "providerID", instance.Name,
 			"Labels", instance.Labels, "Tags", instance.Tags, "Status", instance.Status)
 
-		return &Instance{
+		created := &Instance{
 			InstanceID: instance.Name,
 			Name:       instance.Name,
 			// Refer to https://github.com/karpenter-gcp/karpenter-provider-gcp/pull/45#discussion_r2115586327
@@ -579,7 +592,9 @@ func (p *DefaultProvider) createWithCapacityType(ctx context.Context, nodeClass 
 			Tags:         instance.Labels,
 			Labels:       instance.Labels,
 			Status:       InstanceStatusProvisioning,
-		}, nil, nil
+		}
+		created.KubeLabels, created.KubeLabelsErr = launchedKubeLabels(instance)
+		return created, nil, nil
 	}
 	return nil, errs, nil
 }
@@ -1933,11 +1948,6 @@ func (p *DefaultProvider) syncInstances(ctx context.Context) error {
 					Labels:       inst.Labels,
 					Tags:         inst.Labels,
 					Status:       inst.Status,
-				}
-				if kubeLabels, _, err := metadata.KubeLabelsFromCompute(inst.Metadata); err != nil {
-					instance.KubeLabelsErr = err
-				} else {
-					instance.KubeLabels = kubeLabels
 				}
 				instances = append(instances, instance)
 			}

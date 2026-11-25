@@ -38,14 +38,17 @@ func KubeLabelsFromCompute(api *compute.Metadata) (labels Labels, found bool, er
 	}
 	for _, item := range api.Items {
 		if item != nil && item.Key == KubeLabelsKey {
-			labels, err = parseKubeLabels(lo.FromPtr(item.Value))
+			labels, err = ParseLabels(lo.FromPtr(item.Value))
 			return labels, err == nil, err
 		}
 	}
 	return nil, false, nil
 }
 
-func parseKubeLabels(raw string) (Labels, error) {
+// ParseLabels parses a comma-separated key=value list, the format of the
+// kube-labels metadata item and of the node-labels NodeClaim annotation. Every key
+// and value must be a valid Kubernetes label.
+func ParseLabels(raw string) (Labels, error) {
 	labels := Labels{}
 	if strings.TrimSpace(raw) == "" {
 		return labels, nil
@@ -53,13 +56,13 @@ func parseKubeLabels(raw string) (Labels, error) {
 	for _, pair := range strings.Split(raw, ",") {
 		key, value, ok := strings.Cut(strings.TrimSpace(pair), "=")
 		if !ok {
-			return nil, fmt.Errorf("%s entry %q is not key=value", KubeLabelsKey, pair)
+			return nil, fmt.Errorf("label entry %q is not key=value", pair)
 		}
 		if errs := k8svalidation.IsQualifiedName(key); len(errs) > 0 {
-			return nil, fmt.Errorf("%s key %q is invalid: %s", KubeLabelsKey, key, strings.Join(errs, "; "))
+			return nil, fmt.Errorf("label key %q is invalid: %s", key, strings.Join(errs, "; "))
 		}
 		if errs := k8svalidation.IsValidLabelValue(value); len(errs) > 0 {
-			return nil, fmt.Errorf("%s value of %q is invalid: %s", KubeLabelsKey, key, strings.Join(errs, "; "))
+			return nil, fmt.Errorf("label value of %q is invalid: %s", key, strings.Join(errs, "; "))
 		}
 		labels[key] = value
 	}

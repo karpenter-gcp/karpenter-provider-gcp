@@ -78,7 +78,7 @@ func NewController(
 		controllerspricing.NewController(pricingProvider),
 		nodeclaimgc.NewController(kubeClient, cloudProvider),
 		gcecustommachinetype.NewController(kubeClient, authOptions, gkeProvider),
-		nodecreation.NewController(kubeClient, instanceProvider, gkeProvider, recorder,
+		nodecreation.NewController(kubeClient, gkeProvider, recorder,
 			options.FromContext(ctx).ProjectID, options.FromContext(ctx).NodeCreation),
 	}
 

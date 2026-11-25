@@ -19,6 +19,7 @@ package nodecreation
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -31,14 +32,12 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
-	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/events"
 
 	"github.com/karpenter-gcp/karpenter-provider-gcp/pkg/apis"
 	"github.com/karpenter-gcp/karpenter-provider-gcp/pkg/apis/v1alpha1"
 	"github.com/karpenter-gcp/karpenter-provider-gcp/pkg/operator/options"
 	"github.com/karpenter-gcp/karpenter-provider-gcp/pkg/providers/gke"
-	"github.com/karpenter-gcp/karpenter-provider-gcp/pkg/providers/instance"
 )
 
 const (
@@ -59,15 +58,6 @@ func (r *recorderStub) reasons() []string {
 		reasons = append(reasons, e.Reason)
 	}
 	return reasons
-}
-
-type instanceStub struct {
-	instance *instance.Instance
-	err      error
-}
-
-func (s instanceStub) Get(context.Context, string) (*instance.Instance, error) {
-	return s.instance, s.err
 }
 
 // gkeStub reports mode until InvalidateClusterConfig is called, then modeAfterInvalidate
@@ -101,6 +91,7 @@ func enrolledClaim(enrolledAgo time.Duration) *karpv1.NodeClaim {
 			UID:  "claim-uid",
 			Annotations: map[string]string{
 				v1alpha1.AnnotationKubeletEnrolledAt: testNow.Add(-enrolledAgo).Format(time.RFC3339),
+				v1alpha1.AnnotationNodeLabels:        testNodeLabels,
 			},
 		},
 		Spec: karpv1.NodeClaimSpec{NodeClassRef: &karpv1.NodeClassReference{Group: apis.Group, Kind: "GCENodeClass", Name: "default"}},
@@ -110,12 +101,10 @@ func enrolledClaim(enrolledAgo time.Duration) *karpv1.NodeClaim {
 	return nc
 }
 
-func launchedInstance() *instance.Instance {
-	return &instance.Instance{Name: testInstance, KubeLabels: map[string]string{
-		karpv1.NodePoolLabelKey:       "default",
-		karpv1.NodeRegisteredLabelKey: "true",
-	}}
-}
+// testNodeLabels is the recorded label set. It still carries the registration
+// label, which the provider strips at launch, to prove the controller defends
+// itself against an edited annotation.
+const testNodeLabels = karpv1.NodePoolLabelKey + "=default," + karpv1.NodeRegisteredLabelKey + "=true"
 
 // memClient is the slice of the Kubernetes API the controller uses, in memory.
 type memClient struct {
@@ -199,7 +188,7 @@ func newHarness(t *testing.T, nodeCreation string, mode gke.NodeCreationMode, no
 		kube.nodes[node.Name] = node
 	}
 	h := &harness{client: kube, recorder: &recorderStub{}, gke: &gkeStub{mode: mode}}
-	h.controller = NewController(kube, instanceStub{instance: launchedInstance()}, h.gke, h.recorder, testProject, nodeCreation)
+	h.controller = NewController(kube, h.gke, h.recorder, testProject, nodeCreation)
 	h.controller.now = func() time.Time { return testNow }
 	return h
 }
@@ -394,26 +383,33 @@ func TestReconcileDoesNotCreateForAClaimDeletedSinceTheCacheRead(t *testing.T) {
 }
 
 func TestReconcileInstanceProblems(t *testing.T) {
-	t.Run("instance already gone", func(t *testing.T) {
-		h := newHarness(t, options.NodeCreationAuto, gke.NodeCreationModeControlPlane)
-		h.controller.instances = instanceStub{err: cloudprovider.NewNodeClaimNotFoundError(errors.New("gone"))}
-		h.client.claims["default-abc"] = enrolledClaim(time.Minute)
+	for name, annotation := range map[string]*string{
+		"missing":          nil,
+		"malformed":        ptr("not-a-label-list"),
+		"invalid label":    ptr("a=b c"),
+		"over the bound":   ptr(strings.Repeat("a=b,", maxNodeLabelsBytes/4+1)),
+		"empty value list": ptr("="),
+	} {
+		t.Run("node-labels annotation "+name, func(t *testing.T) {
+			h := newHarness(t, options.NodeCreationAuto, gke.NodeCreationModeControlPlane)
+			claim := enrolledClaim(time.Minute)
+			if annotation == nil {
+				delete(claim.Annotations, v1alpha1.AnnotationNodeLabels)
+			} else {
+				claim.Annotations[v1alpha1.AnnotationNodeLabels] = *annotation
+			}
+			h.client.claims["default-abc"] = claim.DeepCopy()
 
-		_, err := h.reconcile(enrolledClaim(time.Minute))
-		require.NoError(t, err, "garbage collection and the lifecycle controller own a vanished VM")
-		require.Empty(t, h.nodes(t))
-	})
+			_, err := h.reconcile(claim)
+			require.NoError(t, err, "retrying cannot repair the annotation")
+			require.Empty(t, h.nodes(t), "a Node without its labels would be unschedulable for GKE's agents")
+			require.Equal(t, []string{reasonSkipped}, h.recorder.reasons())
 
-	t.Run("malformed kube-labels", func(t *testing.T) {
-		h := newHarness(t, options.NodeCreationAuto, gke.NodeCreationModeControlPlane)
-		h.controller.instances = instanceStub{instance: &instance.Instance{Name: testInstance, KubeLabelsErr: errors.New("bad label")}}
-		h.client.claims["default-abc"] = enrolledClaim(time.Minute)
-
-		_, err := h.reconcile(enrolledClaim(time.Minute))
-		require.Error(t, err)
-		require.Empty(t, h.nodes(t), "a Node without its labels would be unschedulable for GKE's agents")
-		require.Equal(t, []string{reasonSkipped}, h.recorder.reasons())
-	})
+			_, err = h.reconcile(claim)
+			require.NoError(t, err)
+			require.Equal(t, []string{reasonSkipped}, h.recorder.reasons(), "reported once per claim")
+		})
+	}
 
 	t.Run("cluster read fails", func(t *testing.T) {
 		h := newHarness(t, options.NodeCreationAuto, gke.NodeCreationModeControlPlane)
@@ -424,3 +420,5 @@ func TestReconcileInstanceProblems(t *testing.T) {
 		require.Empty(t, h.nodes(t), "an unknown mode must not be guessed")
 	})
 }
+
+func ptr(s string) *string { return &s }

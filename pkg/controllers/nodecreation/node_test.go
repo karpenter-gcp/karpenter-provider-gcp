@@ -69,9 +69,9 @@ func TestFilterNodeLabels(t *testing.T) {
 }
 
 func TestRenderNodeTaints(t *testing.T) {
-	gpu := &instance.Instance{KubeLabels: map[string]string{v1alpha1.LabelGKEGPUDriverVersion: "default"}}
-	taintsOf := func(nodeClass *v1alpha1.GCENodeClass, inst *instance.Instance) []string {
-		node, _ := renderNode("n", "gce://p/z/n", nodeClass, inst)
+	gpu := map[string]string{v1alpha1.LabelGKEGPUDriverVersion: "default"}
+	taintsOf := func(nodeClass *v1alpha1.GCENodeClass, labels map[string]string) []string {
+		node, _ := renderNode("n", "gce://p/z/n", nodeClass, labels)
 		var out []string
 		for _, taint := range node.Spec.Taints {
 			out = append(out, taint.ToString())
@@ -80,7 +80,7 @@ func TestRenderNodeTaints(t *testing.T) {
 	}
 	base := []string{instance.UnregisteredTaintValue, "node.cloudprovider.kubernetes.io/uninitialized=true:NoSchedule"}
 
-	require.Equal(t, base, taintsOf(&v1alpha1.GCENodeClass{}, &instance.Instance{KubeLabels: map[string]string{}}))
+	require.Equal(t, base, taintsOf(&v1alpha1.GCENodeClass{}, map[string]string{}))
 	require.Equal(t, append(base, "nvidia.com/gpu=present:NoSchedule"),
 		taintsOf(&v1alpha1.GCENodeClass{Spec: v1alpha1.GCENodeClassSpec{AutoGPUTaint: true}}, gpu))
 }

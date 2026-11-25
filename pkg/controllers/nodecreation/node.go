@@ -17,6 +17,7 @@ limitations under the License.
 package nodecreation
 
 import (
+	"fmt"
 	"sort"
 	"strings"
 
@@ -25,6 +26,7 @@ import (
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 
 	"github.com/karpenter-gcp/karpenter-provider-gcp/pkg/apis/v1alpha1"
+	"github.com/karpenter-gcp/karpenter-provider-gcp/pkg/metadata"
 	"github.com/karpenter-gcp/karpenter-provider-gcp/pkg/providers/instance"
 )
 
@@ -48,14 +50,31 @@ var kubeletLabelKeys = map[string]struct{}{
 // kubeletLabelDomains are namespaces under which a kubelet may set any label.
 var kubeletLabelDomains = []string{"kubelet.kubernetes.io", "node.kubernetes.io"}
 
+// nodeLabelsOf reads the label set the provider recorded on the NodeClaim at
+// launch. The annotation is untrusted input, since anyone who can patch NodeClaims
+// can edit it: it must be present, bounded and made of valid labels.
+func nodeLabelsOf(nc *karpv1.NodeClaim) (map[string]string, error) {
+	raw, ok := nc.Annotations[v1alpha1.AnnotationNodeLabels]
+	if !ok {
+		return nil, fmt.Errorf("annotation is missing")
+	}
+	if len(raw) > maxNodeLabelsBytes {
+		return nil, fmt.Errorf("annotation is %d bytes, over the %d byte limit", len(raw), maxNodeLabelsBytes)
+	}
+	labels, err := metadata.ParseLabels(raw)
+	if err != nil {
+		return nil, err
+	}
+	return labels, nil
+}
+
 // renderNode builds the Node a kubelet would have registered for a launched
-// instance. It carries the labels the provider wrote into the instance's
-// kube-labels, the launch taints plus the cloud initialization taint, and the
+// instance. It carries the labels the provider recorded on the NodeClaim, the launch taints plus the cloud initialization taint, and the
 // provider ID the core registration controller matches on. It deliberately has
 // no owner reference or finalizer: core adds them when registration completes.
 // dropped lists the label keys the policy removed.
-func renderNode(name, providerID string, nodeClass *v1alpha1.GCENodeClass, inst *instance.Instance) (node *corev1.Node, dropped []string) {
-	labels, dropped := filterNodeLabels(inst.KubeLabels)
+func renderNode(name, providerID string, nodeClass *v1alpha1.GCENodeClass, kubeLabels map[string]string) (node *corev1.Node, dropped []string) {
+	labels, dropped := filterNodeLabels(kubeLabels)
 	return &corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        name,
@@ -64,17 +83,17 @@ func renderNode(name, providerID string, nodeClass *v1alpha1.GCENodeClass, inst 
 		},
 		Spec: corev1.NodeSpec{
 			ProviderID: providerID,
-			Taints:     instance.NodeRegistrationTaints(nodeClass, inst.KubeLabels),
+			Taints:     instance.NodeRegistrationTaints(nodeClass, kubeLabels),
 		},
 	}, dropped
 }
 
-// filterNodeLabels applies the label policy to the instance's kube-labels.
+// filterNodeLabels applies the label policy to the recorded label set.
 //
 // The controller is a trusted control plane component, so unlike a kubelet it may
 // set node-restriction labels (for example secondary boot disk labels). It must
-// not be more permissive than the data it reads, which anyone with
-// compute.instances.setMetadata can write: labels in the kubernetes.io and k8s.io
+// not be more permissive than the data it reads, which anyone who can patch
+// NodeClaims can write: labels in the kubernetes.io and k8s.io
 // namespaces other than those a kubelet may self-assign (node-role among them)
 // are dropped, as are the registration labels that only core may add.
 func filterNodeLabels(in map[string]string) (kept map[string]string, dropped []string) {

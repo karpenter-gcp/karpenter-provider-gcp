@@ -94,14 +94,14 @@ The controller (`pkg/controllers/nodecreation`) acts only when **all** hold: the
 
 The provider never deletes Nodes and adds no deletion code.
 
-| Situation                                                            | Who removes the Node                                                                                                                                     | Status                                         |
-|----------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------|------------------------------------------------|
-| Registered, NodeClaim deleted (consolidation, expiry, drift, manual) | Core: registration adds the `karpenter.sh/termination` finalizer and owner reference; its termination flow drains, deletes the VM, removes the finalizer | Verified live                                  |
-| NodeClaim deleted before registration                                | Core's NodeClaim finalizer deletes Nodes by `providerID`; the CCM lifecycle controller covers the create-versus-delete race                              | Relied upon; deletion spec exists, not yet run |
-| Registered, VM deleted outside Karpenter                             | Expected: core NodeClaim garbage collection and/or the CCM lifecycle controller                                                                          | **Not verified** (open question below)         |
-| Healthy registered Node                                              | Nothing                                                                                                                                                  | Stable for about 10 min in the live run        |
+| Situation                                                            | Who removes the Node                                                                                                                                                             | Status                                         |
+|----------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|------------------------------------------------|
+| Registered, NodeClaim deleted (consolidation, expiry, drift, manual) | Core: registration adds the `karpenter.sh/termination` finalizer and owner reference; its termination flow drains, deletes the VM, removes the finalizer                         | Verified live                                  |
+| NodeClaim deleted before registration                                | Core's NodeClaim finalizer deletes Nodes by `providerID`; the CCM lifecycle controller covers the create-versus-delete race                                                      | Relied upon; deletion spec exists, not yet run |
+| Registered, VM deleted outside Karpenter                             | The cloud controller manager's node lifecycle controller deletes the Node (`DeletingNode: ... does not exist in the cloud provider`); core then finalizes the Node and NodeClaim | Verified live                                  |
+| Healthy registered Node                                              | Nothing                                                                                                                                                                          | Stable for about 10 min in the live run        |
 
-Live check (2026-11-25, 1.37.1 `VIA_CONTROL_PLANE`, an earlier revision): the Node was created and adopted, the claim reached `Ready`, and deleting the NodeClaim removed the Node and VM within 93 s with no provider involvement. If out-of-band VM deletion leaves the Node behind, the follow-up is a provider reconcile that deletes a `created-by` Node whose instance is gone and which no NodeClaim backs; no such code is justified until then.
+Live checks (2026-11-25/26, 1.37.1 `VIA_CONTROL_PLANE`, builds before the setting was removed): the Node was created and adopted and the claim reached `Ready`. Deleting the NodeClaim removed the Node and VM within 93 s with no provider involvement. Deleting the VM out of band removed the Node about 80 s later: the event `DeletingNode` came from `cloud-node-lifecycle-controller` (`... because it does not exist in the cloud provider`), and the NodeClaim was gone within the next few seconds. Karpenter then provisioned a replacement for the pending pod. No provider deletion code is needed.
 
 ### 5. RBAC, observability, version guard
 
@@ -144,10 +144,9 @@ Live check (2026-11-25, 1.37.1 `VIA_CONTROL_PLANE`, an earlier revision): the No
 ### E2E
 
 - `VIA_CONTROL_PLANE`: launch, registration, GKE readiness labels, label diff against a MIG node, DaemonSets, termination, no leaked Nodes; GPU, local-SSD and secondary-boot-disk labels.
-- Claim deleted before registration leaves no Node or VM. Registered node with a VM deleted out of band: Node and NodeClaim removed, and by whom (audit log); settles the open question.
+- Claim deleted before registration leaves no Node or VM. Registered node with a VM deleted out of band: Node and NodeClaim removed (verified manually; not yet a spec).
 - No Node for a non-provider or unenrolled claim.
 - `VIA_KUBELET` regression: unchanged timing and no controller-created Nodes. A `KUBELET` to `CONTROL_PLANE` flip mid-run exercises the forced re-read.
-- Certificate rotation: on the e2e cluster, the kubelet's `system:node:<name>` renewal CSR for an adopted Node is approved and the node stays Ready.
 
 ---
 
@@ -159,7 +158,6 @@ Live check (2026-11-25, 1.37.1 `VIA_CONTROL_PLANE`, an earlier revision): the No
 - [X] Events, metric and logs identify a stuck registration and its cause.
 - [X] Docs cover both modes, troubleshooting, the `nodes: create` privilege and that adoption is not a documented GKE contract.
 - [ ] e2e runs the suites on a 1.37 cluster in both modes and on every supported minor.
-- [ ] Certificate renewal of an adopted Node is verified on the e2e cluster.
 
 ---
 
@@ -187,11 +185,11 @@ If GKE deprecates `VIA_KUBELET`, the mode check and the forced re-read go away a
 
 ---
 
-## Questions Settled and Open
+## Questions Settled
 
 - **Supported path from Google.** None, and none is expected: Google documents no way to bring your own VMs into GKE, so adoption of a pre-existing Node is observed behavior, not a contract. It is documented as unsupported and guarded by the e2e specs.
 - **Label reconciliation.** Settled by the 2026-11-25 live run: `gcp-controller-manager` is among the field managers of the adopted Node, which carries `node.gke.io/last-applied-node-labels` with the same set the provider applied, and the Node's labels matched it. GKE and the provider apply the same values; the e2e label diff against a MIG node stays as the regression guard.
 - **Grace period.** 45 s is the delay before the forced mode re-read, about 45 times the observed kubelet registration time; keep unless e2e data shows otherwise.
 - **Reported default.** Not needed for the design: new 1.37.2 clusters were `VIA_KUBELET` despite the release note, and the controller follows whatever the cluster reports.
-- **Certificate rotation.** Not a question but an e2e check, listed in the test plan and acceptance criteria.
-- **Out-of-band VM deletion (open).** For a registered, controller-created Node whose VM is deleted outside Karpenter, does core garbage collection or the CCM lifecycle controller remove the Node in `VIA_CONTROL_PLANE`? It decides whether provider-side deletion handling is needed.
+- **Out-of-band VM deletion.** Settled by the 2026-11-26 live run: the cloud controller manager's node lifecycle controller removes the Node about 80 s after the VM disappears, and core removes the NodeClaim; see section 4.
+- **Certificate rotation.** Not testable in practice: the kubelet client and serving certificates issued to Karpenter nodes are valid for five years (`notAfter` 2031 on a 2026 issue), and the kubelet renews at 70-90% of that lifetime, far beyond any node's life under consolidation, expiry or drift. The renewal path (`system:node:<name>` self-renewal of a registered claim) is covered by the CSR controller's unit tests and is unchanged by this work.

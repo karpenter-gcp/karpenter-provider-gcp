@@ -37,11 +37,11 @@ The cluster's mode is cached for up to 30 minutes, so a switch to `VIA_CONTROL_P
 
 Karpenter never deletes a `Node` it created.
 
-| Situation                                                                        | What removes the `Node`                                                                                                                                  |
-|----------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------|
-| Registered node, NodeClaim deleted (consolidation, expiry, drift, manual delete) | Core Karpenter: its termination finalizer and the owner reference drain the node, delete the VM and remove the `Node`, as on any other cluster           |
-| NodeClaim deleted before registration                                            | Core's NodeClaim finalizer deletes Nodes by `providerID`; the cloud controller manager removes a `Node` whose VM is gone if creation raced with deletion |
-| Registered node whose VM is deleted outside Karpenter                            | Not yet verified in `VIA_CONTROL_PLANE` mode; see [open question](../proposals/0016-control-plane-node-creation.md#questions-settled-and-open)           |
+| Situation                                                                        | What removes the `Node`                                                                                                                                              |
+|----------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Registered node, NodeClaim deleted (consolidation, expiry, drift, manual delete) | Core Karpenter: its termination finalizer and the owner reference drain the node, delete the VM and remove the `Node`, as on any other cluster                       |
+| NodeClaim deleted before registration                                            | Core's NodeClaim finalizer deletes Nodes by `providerID`; the cloud controller manager removes a `Node` whose VM is gone if creation raced with deletion             |
+| Registered node whose VM is deleted outside Karpenter                            | The cloud controller manager's node lifecycle controller deletes the `Node` because its VM no longer exists (about 80 s in testing); core then removes the NodeClaim |
 
 ## Permissions and limits
 

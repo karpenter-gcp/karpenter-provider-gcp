@@ -27,12 +27,11 @@ Karpenter waits for enrollment instead of creating the `Node` at launch, so that
 - `spec.providerID` and the annotation `karpenter.k8s.gcp/created-by: nodecreation-controller`
 - no owner reference and no finalizer; core adds both at registration
 
-## Setting
+## When Karpenter creates the Node
 
-`NODE_CREATION` (`controller.settings.nodeCreation`):
+There is no setting. Karpenter creates the `Node` only when the GKE cluster reports `nodeCreationConfig.nodeCreationMode = VIA_CONTROL_PLANE`. On a `VIA_KUBELET` cluster it never creates a `Node`, and nothing changes from earlier versions.
 
-- `auto` (default): create the `Node` immediately when the cluster reports `VIA_CONTROL_PLANE`. On a `VIA_KUBELET` cluster, create it only if none exists 45 seconds after enrollment, because GKE keeps reporting the previous mode until a mode change finishes. That fallback emits a `NodeCreationModeMismatch` event.
-- `kubelet`: never create Nodes. On a `VIA_CONTROL_PLANE` cluster the NodeClaim then times out and is replaced, and Karpenter logs an error and emits a `NodeCreationSkipped` event naming the setting.
+The cluster's mode is cached for up to 30 minutes, so a switch to `VIA_CONTROL_PLANE` is not seen immediately. When an enrolled NodeClaim still has no `Node` after 45 seconds, Karpenter re-reads the mode once for that claim and creates the `Node` if the cluster now reports `VIA_CONTROL_PLANE`. The wait is a refresh delay, not a fallback: on a `VIA_KUBELET` cluster the claim keeps waiting for its kubelet.
 
 ## Lifecycle and deletion
 
@@ -42,7 +41,7 @@ Karpenter never deletes a `Node` it created.
 |----------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------|
 | Registered node, NodeClaim deleted (consolidation, expiry, drift, manual delete) | Core Karpenter: its termination finalizer and the owner reference drain the node, delete the VM and remove the `Node`, as on any other cluster           |
 | NodeClaim deleted before registration                                            | Core's NodeClaim finalizer deletes Nodes by `providerID`; the cloud controller manager removes a `Node` whose VM is gone if creation raced with deletion |
-| Registered node whose VM is deleted outside Karpenter                            | Not yet verified in `VIA_CONTROL_PLANE` mode; see [open question 6](../proposals/0016-control-plane-node-creation.md#open-questions)                     |
+| Registered node whose VM is deleted outside Karpenter                            | Not yet verified in `VIA_CONTROL_PLANE` mode; see [open question](../proposals/0016-control-plane-node-creation.md#questions-settled-and-open)           |
 
 ## Permissions and limits
 
@@ -54,6 +53,6 @@ Karpenter never deletes a `Node` it created.
 
 Metric: `karpenter_gcp_nodecreation_total{result="created|exists|collision|error"}`.
 
-Events on the NodeClaim: `NodeCreatedByController`, `NodeCreationSkipped`, `NodeCreationModeMismatch`, `NodeNameCollision`.
+Events on the NodeClaim: `NodeCreatedByController`, `NodeCreationSkipped`, `NodeNameCollision`.
 
 If a NodeClaim stays unregistered although its VM runs, see [Troubleshooting](troubleshooting.md#nodeclaim-stays-unregistered-although-the-vm-runs).

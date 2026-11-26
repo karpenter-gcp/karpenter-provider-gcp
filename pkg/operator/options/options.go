@@ -57,13 +57,6 @@ const (
 	unsupportedConfigurationTTLFlagName   = "unsupported-configuration-ttl"
 	launchTimeoutEnvVarName               = "LAUNCH_TIMEOUT"
 	launchTimeoutFlagName                 = "launch-timeout"
-	nodeCreationEnvVarName                = "NODE_CREATION"
-	nodeCreationFlagName                  = "node-creation"
-
-	// NodeCreationAuto creates the Node for an enrolled NodeClaim when GKE will not.
-	NodeCreationAuto = "auto"
-	// NodeCreationKubelet never creates Nodes; the kubelet or GKE does.
-	NodeCreationKubelet = "kubelet"
 
 	// DefaultQuotaExceededTTL is how long an instance type stays unavailable in a
 	// region after GCE rejects it for exceeded quota.
@@ -118,10 +111,6 @@ type Options struct {
 	// LaunchTimeout is how long a NodeClaim may keep failing to launch with a
 	// non-capacity error before karpenter core deletes and replaces it.
 	LaunchTimeout time.Duration
-	// NodeCreation selects whether the provider creates the Node for a NodeClaim
-	// whose kubelet is enrolled (auto) or leaves Node creation to the kubelet and
-	// GKE (kubelet).
-	NodeCreation string
 }
 
 func (o *Options) AddFlags(fs *coreoptions.FlagSet) {
@@ -140,7 +129,6 @@ func (o *Options) AddFlags(fs *coreoptions.FlagSet) {
 	fs.DurationVar(&o.IPSpaceExhaustedTTL, ipSpaceExhaustedTTLFlagName, env.WithDefaultDuration(ipSpaceExhaustedTTLEnvVarName, DefaultIPSpaceExhaustedTTL), "How long an instance type, zone and capacity type stays unavailable after a launch fails with IP_SPACE_EXHAUSTED on every pod range. Must be positive.")
 	fs.DurationVar(&o.UnsupportedConfigurationTTL, unsupportedConfigurationTTLFlagName, env.WithDefaultDuration(unsupportedConfigurationTTLEnvVarName, DefaultUnsupportedConfigurationTTL), "How long an instance type, zone and capacity type stays unavailable after GCE reports the zone does not support the requested configuration (MACHINE_TYPE_UNSUPPORTED or configuration_availability). Must be positive.")
 	fs.DurationVar(&o.LaunchTimeout, launchTimeoutFlagName, env.WithDefaultDuration(launchTimeoutEnvVarName, DefaultLaunchTimeout), "How long a NodeClaim may keep failing to launch with a non-capacity error before it is deleted and replaced. Must be positive.")
-	fs.StringVar(&o.NodeCreation, nodeCreationFlagName, env.WithDefaultString(nodeCreationEnvVarName, NodeCreationAuto), "Who creates the Node for a launched NodeClaim whose kubelet client certificate was approved. auto creates it when the GKE cluster uses control plane node creation (VIA_CONTROL_PLANE) and as a fallback when the Node is still missing after a grace period; kubelet never creates Nodes.")
 }
 
 func (o *Options) Parse(fs *coreoptions.FlagSet, args ...string) error {

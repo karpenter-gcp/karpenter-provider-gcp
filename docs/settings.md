@@ -129,7 +129,6 @@ DRA is a Kubernetes-level feature. Review the [Kubernetes DRA documentation](htt
 | IP space backoff           | `IP_SPACE_EXHAUSTED_TTL`           | `controller.settings.ipSpaceExhaustedTTL`           | No       | How long an instance type stays unavailable in a zone after a launch fails with `IP_SPACE_EXHAUSTED` on every pod range (default `30s`).                                                                                                                                                   |
 | Unsupported config backoff | `UNSUPPORTED_CONFIGURATION_TTL`    | `controller.settings.unsupportedConfigurationTTL`   | No       | How long an instance type stays unavailable in a zone after GCE reports the zone does not support the requested configuration (default `1h`).                                                                                                                                              |
 | Launch timeout             | `LAUNCH_TIMEOUT`                   | `controller.settings.launchTimeout`                 | No       | How long a NodeClaim may keep failing to launch with a non-capacity error before Karpenter deletes and replaces it (default `5m`).                                                                                                                                                         |
-| Node creation              | `NODE_CREATION`                    | `controller.settings.nodeCreation`                  | No       | Who creates the Node for a launched NodeClaim whose kubelet certificate was approved: `auto` (default, also when GKE uses control plane node creation) or `kubelet` (never; see [Node creation](#node-creation)).                                                                          |
 
 ### Quota exhaustion
 
@@ -151,10 +150,6 @@ It sends nothing that names a pod, node or workload. Telemetry is off by default
 When a launch fails because GCE has no capacity, Karpenter marks that instance type, zone and capacity type unavailable, deletes the NodeClaim, and creates a new NodeClaim from the remaining offerings in its next provisioning batch. How long the offering stays unavailable depends on the GCE error: `STOCKOUT_TTL` for `ZONE_RESOURCE_POOL_EXHAUSTED`, `IP_SPACE_EXHAUSTED_TTL` for `IP_SPACE_EXHAUSTED`, `UNSUPPORTED_CONFIGURATION_TTL` for `MACHINE_TYPE_UNSUPPORTED` and `configuration_availability`, and `QUOTA_EXCEEDED_TTL` for quota errors. A shorter TTL retries the offering sooner. A longer TTL moves new NodeClaims to other instance types and zones for longer.
 
 Other launch errors keep the NodeClaim and retry with exponential backoff from 1s to 1m. If the NodeClaim has still not launched after `LAUNCH_TIMEOUT`, Karpenter deletes it and creates a new one. `STOCKOUT_TTL`, `IP_SPACE_EXHAUSTED_TTL`, `UNSUPPORTED_CONFIGURATION_TTL` and `LAUNCH_TIMEOUT` must be positive; `QUOTA_EXCEEDED_TTL` also accepts `0s` to disable quota backoff.
-
-### Node creation
-
-With `NODE_CREATION=auto` (default) Karpenter creates the `Node` itself for NodeClaims whose kubelet certificate it approved, which GKE clusters with `VIA_CONTROL_PLANE` node creation need. `kubelet` never creates Nodes. See [Node creation](node-creation.md) for how it works, what the `Node` contains, who deletes it, and permissions.
 
 ### Service account resolution
 

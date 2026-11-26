@@ -36,7 +36,6 @@ import (
 
 	"github.com/karpenter-gcp/karpenter-provider-gcp/pkg/apis"
 	"github.com/karpenter-gcp/karpenter-provider-gcp/pkg/apis/v1alpha1"
-	"github.com/karpenter-gcp/karpenter-provider-gcp/pkg/operator/options"
 	"github.com/karpenter-gcp/karpenter-provider-gcp/pkg/providers/gke"
 )
 
@@ -68,11 +67,16 @@ type gkeStub struct {
 	modeAfterInvalidate gke.NodeCreationMode
 	invalidations       int
 	err                 error
+	// errAfterInvalidate fails reads made after InvalidateClusterConfig.
+	errAfterInvalidate error
 }
 
 func (s *gkeStub) GetClusterConfig(context.Context) (*containerv1.Cluster, error) {
 	if s.err != nil {
 		return nil, s.err
+	}
+	if s.errAfterInvalidate != nil && s.invalidations > 0 {
+		return nil, s.errAfterInvalidate
 	}
 	return &containerv1.Cluster{NodeCreationConfig: &containerv1.NodeCreationConfig{NodeCreationMode: string(s.mode)}}, nil
 }
@@ -177,7 +181,7 @@ type harness struct {
 	gke        *gkeStub
 }
 
-func newHarness(t *testing.T, nodeCreation string, mode gke.NodeCreationMode, nodes ...*corev1.Node) *harness {
+func newHarness(t *testing.T, mode gke.NodeCreationMode, nodes ...*corev1.Node) *harness {
 	t.Helper()
 	kube := &memClient{
 		nodes:     map[string]*corev1.Node{},
@@ -188,7 +192,7 @@ func newHarness(t *testing.T, nodeCreation string, mode gke.NodeCreationMode, no
 		kube.nodes[node.Name] = node
 	}
 	h := &harness{client: kube, recorder: &recorderStub{}, gke: &gkeStub{mode: mode}}
-	h.controller = NewController(kube, h.gke, h.recorder, testProject, nodeCreation)
+	h.controller = NewController(kube, h.gke, h.recorder, testProject)
 	h.controller.now = func() time.Time { return testNow }
 	return h
 }
@@ -231,7 +235,7 @@ func TestReconcileIgnoresClaimsThatAreNotEnrolledProviderClaims(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			nc := enrolledClaim(time.Hour)
 			mutate(nc)
-			h := newHarness(t, options.NodeCreationAuto, gke.NodeCreationModeControlPlane)
+			h := newHarness(t, gke.NodeCreationModeControlPlane)
 
 			result, err := h.reconcile(nc)
 			require.NoError(t, err)
@@ -245,7 +249,6 @@ func TestReconcileIgnoresClaimsThatAreNotEnrolledProviderClaims(t *testing.T) {
 func TestReconcileModeGate(t *testing.T) {
 	for _, tt := range []struct {
 		name         string
-		nodeCreation string
 		mode         gke.NodeCreationMode
 		afterRefresh gke.NodeCreationMode
 		enrolledAgo  time.Duration
@@ -256,36 +259,24 @@ func TestReconcileModeGate(t *testing.T) {
 		wantEventReason []string
 	}{
 		{
-			name: "control plane mode creates at once", nodeCreation: options.NodeCreationAuto, mode: gke.NodeCreationModeControlPlane,
+			name: "control plane mode creates at once", mode: gke.NodeCreationModeControlPlane,
 			enrolledAgo: time.Second, wantNode: true, wantEventReason: []string{reasonNodeCreated},
 		},
 		{
-			name: "kubelet mode waits out the grace period", nodeCreation: options.NodeCreationAuto, mode: gke.NodeCreationModeKubelet,
+			name: "kubelet mode waits out the grace period", mode: gke.NodeCreationModeKubelet,
 			enrolledAgo: 10 * time.Second, wantRequeue: 35 * time.Second,
 		},
 		{
-			name: "kubelet mode creates after the grace period and warns", nodeCreation: options.NodeCreationAuto, mode: gke.NodeCreationModeKubelet,
-			enrolledAgo: 46 * time.Second, wantNode: true, wantRefreshes: 1, wantEventReason: []string{reasonModeMismatch, reasonNodeCreated},
+			name: "kubelet mode never creates, even for an overdue claim", mode: gke.NodeCreationModeKubelet,
+			enrolledAgo: time.Hour, wantRefreshes: 1,
 		},
 		{
-			name: "mode change seen on forced re-read creates without a warning", nodeCreation: options.NodeCreationAuto, mode: gke.NodeCreationModeKubelet,
+			name: "mode change seen on forced re-read creates", mode: gke.NodeCreationModeKubelet,
 			afterRefresh: gke.NodeCreationModeControlPlane, enrolledAgo: 46 * time.Second, wantNode: true, wantRefreshes: 1, wantEventReason: []string{reasonNodeCreated},
-		},
-		{
-			name: "kubelet setting never creates in kubelet mode", nodeCreation: options.NodeCreationKubelet, mode: gke.NodeCreationModeKubelet,
-			enrolledAgo: time.Hour,
-		},
-		{
-			name: "kubelet setting on control plane waits, then explains", nodeCreation: options.NodeCreationKubelet, mode: gke.NodeCreationModeControlPlane,
-			enrolledAgo: 10 * time.Second, wantRequeue: 35 * time.Second,
-		},
-		{
-			name: "kubelet setting on control plane reports the stuck claim", nodeCreation: options.NodeCreationKubelet, mode: gke.NodeCreationModeControlPlane,
-			enrolledAgo: time.Minute, wantEventReason: []string{reasonSkipped},
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			h := newHarness(t, tt.nodeCreation, tt.mode)
+			h := newHarness(t, tt.mode)
 			h.gke.modeAfterInvalidate = tt.afterRefresh
 
 			result, err := h.reconcile(enrolledClaim(tt.enrolledAgo))
@@ -302,8 +293,34 @@ func TestReconcileModeGate(t *testing.T) {
 	}
 }
 
+func TestReconcileRefreshesModeOncePerClaim(t *testing.T) {
+	h := newHarness(t, gke.NodeCreationModeKubelet)
+	claim := enrolledClaim(time.Hour)
+
+	for range 3 {
+		_, err := h.reconcile(claim)
+		require.NoError(t, err)
+	}
+	require.Equal(t, 1, h.gke.invalidations, "a stuck claim must not hit the cluster API on every reconcile")
+	require.Empty(t, h.nodes(t))
+
+	t.Run("a failed re-read is retried", func(t *testing.T) {
+		h := newHarness(t, gke.NodeCreationModeKubelet)
+		claim := enrolledClaim(time.Hour)
+		h.gke.errAfterInvalidate = errors.New("container API unavailable")
+
+		_, err := h.reconcile(claim)
+		require.Error(t, err)
+		h.gke.errAfterInvalidate = nil
+		h.gke.modeAfterInvalidate = gke.NodeCreationModeControlPlane
+		_, err = h.reconcile(claim)
+		require.NoError(t, err)
+		require.Len(t, h.nodes(t), 1)
+	})
+}
+
 func TestReconcileCreatesNodeKubeletCanAdopt(t *testing.T) {
-	h := newHarness(t, options.NodeCreationAuto, gke.NodeCreationModeControlPlane)
+	h := newHarness(t, gke.NodeCreationModeControlPlane)
 
 	_, err := h.reconcile(enrolledClaim(time.Second))
 	require.NoError(t, err)
@@ -321,7 +338,7 @@ func TestReconcileCreatesNodeKubeletCanAdopt(t *testing.T) {
 func TestReconcileLeavesExistingNodesAlone(t *testing.T) {
 	t.Run("node with the expected name and provider ID", func(t *testing.T) {
 		existing := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: testInstance, Labels: map[string]string{"kubelet": "made-me"}}, Spec: corev1.NodeSpec{ProviderID: testProviderID}}
-		h := newHarness(t, options.NodeCreationAuto, gke.NodeCreationModeControlPlane, existing)
+		h := newHarness(t, gke.NodeCreationModeControlPlane, existing)
 
 		_, err := h.reconcile(enrolledClaim(time.Minute))
 		require.NoError(t, err)
@@ -333,7 +350,7 @@ func TestReconcileLeavesExistingNodesAlone(t *testing.T) {
 
 	t.Run("differently named node with the same provider ID", func(t *testing.T) {
 		stale := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "recycled-name"}, Spec: corev1.NodeSpec{ProviderID: testProviderID}}
-		h := newHarness(t, options.NodeCreationAuto, gke.NodeCreationModeControlPlane, stale)
+		h := newHarness(t, gke.NodeCreationModeControlPlane, stale)
 
 		for range 2 {
 			_, err := h.reconcile(enrolledClaim(time.Minute))
@@ -345,7 +362,7 @@ func TestReconcileLeavesExistingNodesAlone(t *testing.T) {
 
 	t.Run("node of another instance owns the name", func(t *testing.T) {
 		squatter := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: testInstance}, Spec: corev1.NodeSpec{ProviderID: "gce://my-project/us-central1-a/other"}}
-		h := newHarness(t, options.NodeCreationAuto, gke.NodeCreationModeControlPlane, squatter)
+		h := newHarness(t, gke.NodeCreationModeControlPlane, squatter)
 
 		_, err := h.reconcile(enrolledClaim(time.Minute))
 		require.Error(t, err, "a name collision is not ours to repair, and must back off")
@@ -359,7 +376,7 @@ func TestReconcileLeavesExistingNodesAlone(t *testing.T) {
 func TestReconcileIsIdempotentWhenTheCacheLags(t *testing.T) {
 	// Our own earlier create is not visible in the cached list yet, so the second
 	// reconcile tries to create again and must treat AlreadyExists as success.
-	h := newHarness(t, options.NodeCreationAuto, gke.NodeCreationModeControlPlane)
+	h := newHarness(t, gke.NodeCreationModeControlPlane)
 	h.client.hideNodes = true
 	for range 2 {
 		_, err := h.reconcile(enrolledClaim(time.Minute))
@@ -373,7 +390,7 @@ func TestReconcileDoesNotCreateForAClaimDeletedSinceTheCacheRead(t *testing.T) {
 	deleting.Finalizers = []string{"karpenter.sh/termination"}
 	now := metav1.Now()
 	deleting.DeletionTimestamp = &now
-	h := newHarness(t, options.NodeCreationAuto, gke.NodeCreationModeControlPlane)
+	h := newHarness(t, gke.NodeCreationModeControlPlane)
 	h.client.claims["default-abc"] = deleting
 
 	// The reconciled copy is the stale, not yet deleting one.
@@ -391,7 +408,7 @@ func TestReconcileInstanceProblems(t *testing.T) {
 		"empty value list": ptr("="),
 	} {
 		t.Run("node-labels annotation "+name, func(t *testing.T) {
-			h := newHarness(t, options.NodeCreationAuto, gke.NodeCreationModeControlPlane)
+			h := newHarness(t, gke.NodeCreationModeControlPlane)
 			claim := enrolledClaim(time.Minute)
 			if annotation == nil {
 				delete(claim.Annotations, v1alpha1.AnnotationNodeLabels)
@@ -412,7 +429,7 @@ func TestReconcileInstanceProblems(t *testing.T) {
 	}
 
 	t.Run("cluster read fails", func(t *testing.T) {
-		h := newHarness(t, options.NodeCreationAuto, gke.NodeCreationModeControlPlane)
+		h := newHarness(t, gke.NodeCreationModeControlPlane)
 		h.gke.err = errors.New("container API unavailable")
 
 		_, err := h.reconcile(enrolledClaim(time.Minute))

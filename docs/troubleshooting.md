@@ -188,7 +188,7 @@ The usual cause is a cluster with control plane node creation, where GKE does no
 gcloud container clusters describe <cluster> --location <location> --format='value(nodeCreationConfig.nodeCreationMode)'
 ```
 
-`VIA_CONTROL_PLANE` means Karpenter must create the `Node` itself (`NODE_CREATION=auto`, the default). Check the NodeClaim for the `kubelet-enrolled-at` annotation (set when the CSR was approved) and its events:
+`VIA_CONTROL_PLANE` means Karpenter must create the `Node` itself. Check the NodeClaim for the `kubelet-enrolled-at` annotation (set when the CSR was approved) and its events:
 
 ```sh
 kubectl get nodeclaim <name> -o jsonpath='{.metadata.annotations}'
@@ -196,13 +196,12 @@ kubectl describe nodeclaim <name>
 ```
 
 - `NodeCreatedByController`: Karpenter created the `Node`; continue with the kubelet and the cloud controller manager.
-- `NodeCreationSkipped` mentioning `NODE_CREATION=kubelet`: set it back to `auto`.
 - `NodeCreationSkipped` mentioning the `karpenter.k8s.gcp/node-labels` annotation: the NodeClaim has no usable label record, typically because it was launched by an older Karpenter version, or its VM was adopted after an interrupted launch. Karpenter does not retry; the claim is replaced at the registration timeout.
 - `NodeNameCollision`: a different `Node` already uses the instance name or provider ID; Karpenter leaves it unchanged. Delete the stale `Node` if the instance it describes is gone.
 - No annotation: the CSR was never approved; see [CSR not approved](#csr-certificate-signing-request-not-approved).
 - A `Node` exists but never becomes Ready, and GKE agents (`anetd`, the metadata server) fail: compare the `Node`'s labels and taints with a GKE-managed node's. A controller-created `Node` carries the annotation `karpenter.k8s.gcp/created-by: nodecreation-controller`.
 
-On a Karpenter version without node creation support, or with `NODE_CREATION=kubelet`, a cluster in `VIA_CONTROL_PLANE` mode needs kubelet registration instead. Switch the cluster; the change applies only to nodes created afterwards, and Karpenter replaces the unregistered NodeClaims on its own:
+On a Karpenter version without node creation support, a cluster in `VIA_CONTROL_PLANE` mode needs kubelet registration instead. Switch the cluster; the change applies only to nodes created afterwards, and Karpenter replaces the unregistered NodeClaims on its own:
 
 ```sh
 gcloud container clusters update <cluster> --location=<location> \
@@ -211,7 +210,7 @@ gcloud container clusters update <cluster> --location=<location> \
 
 With the [Terraform module](https://github.com/karpenter-gcp/karpenter-provider-gcp/tree/main/deploy/terraform), set `node_creation_mode = "VIA_KUBELET"` instead.
 
-See [Node creation](node-creation.md) for the setting and its limits.
+See [Node creation](node-creation.md) for how it works and its limits.
 
 ---
 

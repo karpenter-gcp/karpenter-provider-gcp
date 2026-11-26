@@ -43,14 +43,14 @@ import (
 
 	"github.com/karpenter-gcp/karpenter-provider-gcp/pkg/apis"
 	"github.com/karpenter-gcp/karpenter-provider-gcp/pkg/apis/v1alpha1"
-	"github.com/karpenter-gcp/karpenter-provider-gcp/pkg/operator/options"
 	"github.com/karpenter-gcp/karpenter-provider-gcp/pkg/providers/gke"
 	"github.com/karpenter-gcp/karpenter-provider-gcp/pkg/providers/instance"
 )
 
-// DefaultGrace is how long after enrollment the controller waits for the kubelet
-// or GKE to create the Node when the cluster reports VIA_KUBELET. In observed runs
-// the kubelet registered about a second after its certificate was issued.
+// DefaultGrace is how long after enrollment a claim may stay without a Node before
+// the controller re-reads the cluster's node creation mode. The cached mode can
+// lag a mode change by the cluster-config cache TTL; in observed runs the kubelet
+// registered about a second after its certificate was issued.
 const DefaultGrace = 45 * time.Second
 
 // maxNodeLabelsBytes bounds the node-labels annotation the controller parses. The
@@ -62,35 +62,32 @@ type Controller struct {
 	// apiReader reads straight from the API server. The controller uses it to
 	// re-check a NodeClaim and an existing Node right before and after creating a
 	// Node, when a stale cache entry would cause a wrong decision.
-	apiReader    client.Reader
-	gke          gke.Provider
-	recorder     events.Recorder
-	now          func() time.Time
-	projectID    string
-	nodeCreation string
-	grace        time.Duration
+	apiReader client.Reader
+	gke       gke.Provider
+	recorder  events.Recorder
+	now       func() time.Time
+	projectID string
+	grace     time.Duration
 
 	mu       sync.Mutex
 	lastMode gke.NodeCreationMode
 	// reported records, per NodeClaim, the one-time reports already made, so a
 	// claim that stays stuck does not repeat them on every reconcile.
-	reported map[types.UID]map[string]struct{}
+	reportedFor map[types.UID]map[string]struct{}
 }
 
-// NewController creates the controller. nodeCreation is the operator setting
-// (options.NodeCreationAuto or options.NodeCreationKubelet) and projectID the
-// project whose instances the provider owns.
-func NewController(kubeClient client.Client, gkeProvider gke.Provider, recorder events.Recorder, projectID, nodeCreation string) *Controller {
+// NewController creates the controller. projectID is the project whose instances
+// the provider owns.
+func NewController(kubeClient client.Client, gkeProvider gke.Provider, recorder events.Recorder, projectID string) *Controller {
 	return &Controller{
-		kubeClient:   kubeClient,
-		apiReader:    kubeClient,
-		gke:          gkeProvider,
-		recorder:     recorder,
-		now:          time.Now,
-		projectID:    projectID,
-		nodeCreation: nodeCreation,
-		grace:        DefaultGrace,
-		reported:     map[types.UID]map[string]struct{}{},
+		kubeClient:  kubeClient,
+		apiReader:   kubeClient,
+		gke:         gkeProvider,
+		recorder:    recorder,
+		now:         time.Now,
+		projectID:   projectID,
+		grace:       DefaultGrace,
+		reportedFor: map[types.UID]map[string]struct{}{},
 	}
 }
 
@@ -169,54 +166,40 @@ func (c *Controller) candidateFor(ctx context.Context, nc *karpv1.NodeClaim) (ca
 	return candidate{nodeName: name, providerID: nc.Status.ProviderID, enrolledAt: enrolledAt}, true
 }
 
-// shouldCreate applies the mode gate. When it declines it returns how long to
-// wait before asking again, or zero when there is nothing to wait for.
+// shouldCreate applies the mode gate: the provider creates a Node only when the
+// cluster uses control plane node creation, and never when the kubelet registers
+// itself. When it declines it returns how long to wait before asking again, or zero
+// when there is nothing to wait for.
+//
+// The mode comes from the cached cluster config, which can lag a mode change by
+// its TTL. A claim that is still without a Node once the grace period has passed
+// triggers one forced re-read, so a claim launched after a switch to
+// VIA_CONTROL_PLANE does not wait for the cache to expire.
 func (c *Controller) shouldCreate(ctx context.Context, nc *karpv1.NodeClaim, cand candidate) (create bool, requeue time.Duration, err error) {
 	mode, err := gke.ResolveNodeCreationMode(ctx, c.gke)
 	if err != nil {
 		return false, 0, err
 	}
 	c.observeMode(ctx, mode)
-	wait := cand.enrolledAt.Add(c.grace).Sub(c.now())
-
-	if c.nodeCreation == options.NodeCreationKubelet {
-		if mode != gke.NodeCreationModeControlPlane {
-			return false, 0, nil
-		}
-		if wait > 0 {
-			return false, wait, nil
-		}
-		c.reportOnce(nc.UID, "disabled", func() {
-			why := fmt.Sprintf("The cluster uses VIA_CONTROL_PLANE node creation, which does not create Nodes for Karpenter VMs, and %s=%s stops the provider from creating them. The NodeClaim will not register; set %s=%s", "NODE_CREATION", options.NodeCreationKubelet, "NODE_CREATION", options.NodeCreationAuto)
-			log.FromContext(ctx).Error(nil, why, "nodeClaim", nc.Name, "node", cand.nodeName)
-			c.recorder.Publish(skippedEvent(nc, why))
-		})
-		return false, 0, nil
-	}
-
 	if mode == gke.NodeCreationModeControlPlane {
 		return true, 0, nil
 	}
-	if wait > 0 {
+	if wait := cand.enrolledAt.Add(c.grace).Sub(c.now()); wait > 0 {
 		return false, wait, nil
 	}
-	// The reported mode lags a mode change: clusters.get keeps returning the old
-	// mode while the new behavior already applies. Re-read it before falling back.
+	if c.reported(nc.UID, "mode-refreshed") {
+		return false, 0, nil
+	}
 	c.gke.InvalidateClusterConfig()
 	mode, err = gke.ResolveNodeCreationMode(ctx, c.gke)
 	if err != nil {
 		return false, 0, err
 	}
+	c.reportOnce(nc.UID, "mode-refreshed", func() {})
 	c.observeMode(ctx, mode)
-	if mode != gke.NodeCreationModeControlPlane {
-		c.recorder.Publish(modeMismatchEvent(nc))
-	}
-	return true, 0, nil
+	return mode == gke.NodeCreationModeControlPlane, 0, nil
 }
 
-// createNode creates the Node for an enrolled NodeClaim. It never updates or
-// patches an existing Node: after creation the kubelet, the cloud controller
-// manager and core own it.
 func (c *Controller) createNode(ctx context.Context, nc *karpv1.NodeClaim, cand candidate) error {
 	// The cached claim may be stale. A claim deleted since would leave a Node behind
 	// that only the cloud controller manager cleans up.
@@ -308,19 +291,19 @@ func (c *Controller) observeMode(ctx context.Context, mode gke.NodeCreationMode)
 		return
 	}
 	if previous == "" {
-		log.FromContext(ctx).Info("resolved GKE node creation mode", "mode", mode, "nodeCreation", c.nodeCreation)
+		log.FromContext(ctx).Info("resolved GKE node creation mode", "mode", mode)
 		return
 	}
-	log.FromContext(ctx).Info("GKE node creation mode changed", "from", previous, "to", mode, "nodeCreation", c.nodeCreation)
+	log.FromContext(ctx).Info("GKE node creation mode changed", "from", previous, "to", mode)
 }
 
 // reportOnce runs report the first time it is called for a claim and what.
 func (c *Controller) reportOnce(uid types.UID, what string, report func()) {
 	c.mu.Lock()
-	seen := c.reported[uid]
+	seen := c.reportedFor[uid]
 	if seen == nil {
 		seen = map[string]struct{}{}
-		c.reported[uid] = seen
+		c.reportedFor[uid] = seen
 	}
 	_, already := seen[what]
 	seen[what] = struct{}{}
@@ -330,11 +313,19 @@ func (c *Controller) reportOnce(uid types.UID, what string, report func()) {
 	}
 }
 
+// reported reports whether report ran for the claim and what.
+func (c *Controller) reported(uid types.UID, what string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	_, ok := c.reportedFor[uid][what]
+	return ok
+}
+
 // forget drops the once-per-claim state of a claim that is no longer a candidate.
 func (c *Controller) forget(uid types.UID) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	delete(c.reported, uid)
+	delete(c.reportedFor, uid)
 }
 
 func (c *Controller) Register(_ context.Context, m manager.Manager) error {

@@ -28,7 +28,6 @@ import (
 const (
 	reasonNodeCreated      = "NodeCreatedByController"
 	reasonSkipped          = "NodeCreationSkipped"
-	reasonModeMismatch     = "NodeCreationModeMismatch"
 	reasonNodeNameConflict = "NodeNameCollision"
 )
 
@@ -50,16 +49,6 @@ func skippedEvent(nc *karpv1.NodeClaim, why string) events.Event {
 		Message:        why,
 		DedupeValues:   []string{string(nc.UID), why},
 		DedupeTimeout:  5 * time.Minute,
-	}
-}
-
-func modeMismatchEvent(nc *karpv1.NodeClaim) events.Event {
-	return events.Event{
-		InvolvedObject: nc,
-		Type:           corev1.EventTypeWarning,
-		Reason:         reasonModeMismatch,
-		Message:        "The cluster reports VIA_KUBELET but no Node appeared after the kubelet was enrolled; created the Node anyway. The reported mode lags a node creation mode change",
-		DedupeValues:   []string{string(nc.UID)},
 	}
 }
 

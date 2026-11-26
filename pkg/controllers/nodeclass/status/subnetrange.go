@@ -20,10 +20,12 @@ import (
 	"context"
 	"time"
 
+	containerv1 "google.golang.org/api/container/v1"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"github.com/karpenter-gcp/karpenter-provider-gcp/pkg/apis/v1alpha1"
+	"github.com/karpenter-gcp/karpenter-provider-gcp/pkg/operator/options"
 	"github.com/karpenter-gcp/karpenter-provider-gcp/pkg/providers/gke"
 	"github.com/karpenter-gcp/karpenter-provider-gcp/pkg/providers/subnet"
 )
@@ -36,10 +38,14 @@ type SubnetRange struct {
 }
 
 func (s *SubnetRange) Reconcile(ctx context.Context, nodeClass *v1alpha1.GCENodeClass) (reconcile.Result, error) {
-	cluster, err := s.gkeProvider.GetClusterConfig(ctx)
-	if err != nil {
-		log.FromContext(ctx).Error(err, "getting cluster config for subnet ranges")
-		return reconcile.Result{}, err
+	var cluster *containerv1.Cluster
+	if !options.FromContext(ctx).IsSelfHosted() {
+		var err error
+		cluster, err = s.gkeProvider.GetClusterConfig(ctx)
+		if err != nil {
+			log.FromContext(ctx).Error(err, "getting cluster config for subnet ranges")
+			return reconcile.Result{}, err
+		}
 	}
 
 	names := nodeClass.PodSubnetRangeNames()
@@ -49,6 +55,7 @@ func (s *SubnetRange) Reconcile(ctx context.Context, nodeClass *v1alpha1.GCENode
 	var counts map[string]int64
 	network, target := subnet.PrimaryNetwork(nodeClass, cluster)
 	if len(names) > 0 && target != "" {
+		var err error
 		counts, err = s.subnetProvider.GetFreeIPCounts(ctx, network, target)
 		if err != nil {
 			log.FromContext(ctx).Error(err, "getting pod range free IPs, publishing names without counts", "subnetwork", target)

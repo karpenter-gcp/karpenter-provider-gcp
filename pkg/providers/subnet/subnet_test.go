@@ -56,7 +56,7 @@ func TestConcurrentReadsUseCachedCapacity(t *testing.T) {
 	client := &fakeSubnetworksClient{get: func(context.Context, *computepb.GetSubnetworkRequest) (*computepb.Subnetwork, error) {
 		return freeIPs(1000), nil
 	}}
-	p := subnet.NewProvider(client, "us-central1", clock.RealClock{})
+	p := subnet.NewProvider(client, "test-project", "us-central1", clock.RealClock{})
 	counts := make([]map[string]int64, 4)
 	errs := make([]error, len(counts))
 	var wg sync.WaitGroup
@@ -82,7 +82,7 @@ func TestCapacityCacheExpires(t *testing.T) {
 		client := &fakeSubnetworksClient{get: func(context.Context, *computepb.GetSubnetworkRequest) (*computepb.Subnetwork, error) {
 			return freeIPs(available), nil
 		}}
-		p := subnet.NewProvider(client, "us-central1", clock.RealClock{})
+		p := subnet.NewProvider(client, "test-project", "us-central1", clock.RealClock{})
 		_, err := p.GetFreeIPCounts(t.Context(), testNetwork, "default")
 		require.NoError(t, err)
 		available = 500
@@ -108,7 +108,7 @@ func TestInvalidateClearsCapacityAndErrors(t *testing.T) {
 			client := &fakeSubnetworksClient{get: func(context.Context, *computepb.GetSubnetworkRequest) (*computepb.Subnetwork, error) {
 				return freeIPs(available), failure
 			}}
-			p := subnet.NewProvider(client, "us-central1", clock.RealClock{})
+			p := subnet.NewProvider(client, "test-project", "us-central1", clock.RealClock{})
 			_, err := p.GetFreeIPCounts(t.Context(), testNetwork, "default")
 			require.ErrorIs(t, err, failure)
 			available, failure = 500, nil
@@ -128,7 +128,7 @@ func TestFailedLookupRetriesAfterCooldown(t *testing.T) {
 		client := &fakeSubnetworksClient{get: func(context.Context, *computepb.GetSubnetworkRequest) (*computepb.Subnetwork, error) {
 			return freeIPs(1000), failure
 		}}
-		p := subnet.NewProvider(client, "us-central1", clock.RealClock{})
+		p := subnet.NewProvider(client, "test-project", "us-central1", clock.RealClock{})
 		_, err := p.GetFreeIPCounts(t.Context(), testNetwork, "default")
 		require.ErrorIs(t, err, denied)
 		failure = nil
@@ -151,7 +151,7 @@ func TestCanceledRefreshDoesNotCacheError(t *testing.T) {
 		cancel()
 		return nil, ctx.Err()
 	}}
-	p := subnet.NewProvider(client, "us-central1", clock.RealClock{})
+	p := subnet.NewProvider(client, "test-project", "us-central1", clock.RealClock{})
 	_, err := p.GetFreeIPCounts(ctx, testNetwork, "default")
 	require.ErrorIs(t, err, context.Canceled)
 	client.get = func(context.Context, *computepb.GetSubnetworkRequest) (*computepb.Subnetwork, error) {
@@ -167,10 +167,116 @@ func TestCanceledCallerSkipsLookup(t *testing.T) {
 	client := &fakeSubnetworksClient{get: func(context.Context, *computepb.GetSubnetworkRequest) (*computepb.Subnetwork, error) {
 		return freeIPs(1000), nil
 	}}
-	p := subnet.NewProvider(client, "us-central1", clock.RealClock{})
+	p := subnet.NewProvider(client, "test-project", "us-central1", clock.RealClock{})
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 	_, err := p.GetFreeIPCounts(ctx, testNetwork, "default")
 	require.ErrorIs(t, err, context.Canceled)
 	require.Zero(t, client.calls.Load())
+}
+
+func TestResolveTargetWithoutNetworkUsesDefaultProject(t *testing.T) {
+	var requests []*computepb.GetSubnetworkRequest
+	client := &fakeSubnetworksClient{get: func(_ context.Context, req *computepb.GetSubnetworkRequest) (*computepb.Subnetwork, error) {
+		requests = append(requests, req)
+		return freeIPs(4096), nil
+	}}
+	p := subnet.NewProvider(client, "operator-project", "us-central1", clock.RealClock{})
+
+	// Bare name, regional path, and canonical full path all resolve to the same cache key.
+	counts, err := p.GetFreeIPCounts(t.Context(), "", "nodes")
+	require.NoError(t, err)
+	require.EqualValues(t, 4096, counts["pods"])
+	require.Len(t, requests, 1)
+	require.Equal(t, "operator-project", requests[0].GetProject())
+	require.Equal(t, "us-central1", requests[0].GetRegion())
+	require.Equal(t, "nodes", requests[0].GetSubnetwork())
+
+	_, err = p.GetFreeIPCounts(t.Context(), "", "regions/us-central1/subnetworks/nodes")
+	require.NoError(t, err)
+	_, err = p.GetFreeIPCounts(t.Context(), "", "projects/operator-project/regions/us-central1/subnetworks/nodes")
+	require.NoError(t, err)
+	require.EqualValues(t, 1, client.calls.Load(), "equivalent self-hosted subnetwork refs must share cache entry")
+
+	// Invalidation with the Compute-derived network and canonical subnetwork ref clears the entry.
+	p.Invalidate("projects/operator-project/global/networks/vpc", "projects/operator-project/regions/us-central1/subnetworks/nodes")
+	_, err = p.GetFreeIPCounts(t.Context(), "", "nodes")
+	require.NoError(t, err)
+	require.EqualValues(t, 2, client.calls.Load())
+
+	// Different host project in a full subnetwork ref takes precedence over defaultProject.
+	_, err = p.GetFreeIPCounts(t.Context(), "", "projects/host-project/regions/europe-west4/subnetworks/shared")
+	require.NoError(t, err)
+	require.Equal(t, "host-project", requests[len(requests)-1].GetProject())
+	require.Equal(t, "europe-west4", requests[len(requests)-1].GetRegion())
+	require.Equal(t, "shared", requests[len(requests)-1].GetSubnetwork())
+}
+
+func TestCanonicalSubnetworkRef(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name       string
+		network    string
+		subnetwork string
+		want       string
+		expectErr  bool
+	}{
+		{
+			name:       "bare name uses defaults",
+			subnetwork: "nodes",
+			want:       "projects/default-project/regions/us-central1/subnetworks/nodes",
+		},
+		{
+			name:       "bare name inherits host project from explicit network",
+			network:    "projects/host-project/global/networks/shared-vpc",
+			subnetwork: "nodes",
+			want:       "projects/host-project/regions/us-central1/subnetworks/nodes",
+		},
+		{
+			name:       "regional path uses default project",
+			subnetwork: "regions/europe-west4/subnetworks/nodes",
+			want:       "projects/default-project/regions/europe-west4/subnetworks/nodes",
+		},
+		{
+			name:       "regional path inherits host project from explicit network",
+			network:    "projects/host-project/global/networks/shared-vpc",
+			subnetwork: "regions/europe-west4/subnetworks/nodes",
+			want:       "projects/host-project/regions/europe-west4/subnetworks/nodes",
+		},
+		{
+			name:       "project-qualified path overrides explicit network project",
+			network:    "projects/host-project/global/networks/shared-vpc",
+			subnetwork: "projects/other/regions/europe-west4/subnetworks/nodes",
+			want:       "projects/other/regions/europe-west4/subnetworks/nodes",
+		},
+		{
+			name:       "full URL",
+			subnetwork: "https://www.googleapis.com/compute/v1/projects/other/regions/europe-west4/subnetworks/nodes",
+			want:       "projects/other/regions/europe-west4/subnetworks/nodes",
+		},
+		{
+			name:       "path without subnetworks segment rejected",
+			subnetwork: "projects/other/global/networks/my-vpc",
+			expectErr:  true,
+		},
+		{
+			name:       "unqualified subnetworks path rejected",
+			subnetwork: "subnetworks/nodes",
+			expectErr:  true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := subnet.CanonicalSubnetworkRef(tc.network, tc.subnetwork, "default-project", "us-central1")
+			if tc.expectErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tc.want, got)
+		})
+	}
 }

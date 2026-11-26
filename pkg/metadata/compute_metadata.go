@@ -18,6 +18,7 @@ package metadata
 
 import (
 	"encoding/json"
+	"fmt"
 	"maps"
 	"sort"
 	"strings"
@@ -26,6 +27,14 @@ import (
 	"google.golang.org/api/compute/v1"
 	kubeletconfig "k8s.io/kubelet/config/v1beta1"
 	"sigs.k8s.io/yaml"
+)
+
+const (
+	// MaxMetadataValueBytes is GCE's limit on a single metadata value, in UTF-8 bytes.
+	MaxMetadataValueBytes = 262144
+	// MaxMetadataTotalBytes is GCE's limit on the combined size of all metadata keys and
+	// values on one instance, in UTF-8 bytes.
+	MaxMetadataTotalBytes = 524288
 )
 
 // retainedSourceMetadataKeys are raw source-template keys copied through from
@@ -220,6 +229,45 @@ func (m *InstanceMetadata) ToComputeInstanceLabels() map[string]string {
 	}
 	maps.Copy(labels, m.instanceLabels)
 	return labels
+}
+
+// HasValue reports whether md carries key with a value exactly equal to value.
+func HasValue(md *compute.Metadata, key, value string) bool {
+	if md == nil {
+		return false
+	}
+	for _, item := range md.Items {
+		if item != nil && item.Key == key {
+			return lo.FromPtr(item.Value) == value
+		}
+	}
+	return false
+}
+
+// ValidateComputeMetadataSize checks rendered metadata against GCE's byte limits.
+// CRD maxLength counts characters, not bytes, so a multi-byte value can pass CEL yet
+// be rejected by GCE; failing here names the offending key.
+func ValidateComputeMetadataSize(md *compute.Metadata) error {
+	if md == nil {
+		return nil
+	}
+	total := 0
+	for _, item := range md.Items {
+		if item == nil {
+			continue
+		}
+		value := lo.FromPtr(item.Value)
+		if len(value) > MaxMetadataValueBytes {
+			return fmt.Errorf("metadata value for key %q is %d bytes, exceeding the GCE per-value limit of %d bytes",
+				item.Key, len(value), MaxMetadataValueBytes)
+		}
+		total += len(item.Key) + len(value)
+	}
+	if total > MaxMetadataTotalBytes {
+		return fmt.Errorf("metadata keys and values total %d bytes, exceeding the GCE per-instance limit of %d bytes",
+			total, MaxMetadataTotalBytes)
+	}
+	return nil
 }
 
 type metadataValues map[string]string

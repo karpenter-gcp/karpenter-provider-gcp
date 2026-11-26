@@ -28,6 +28,8 @@ import (
 	"google.golang.org/api/container/v1"
 	"google.golang.org/api/googleapi"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+
+	"github.com/karpenter-gcp/karpenter-provider-gcp/pkg/metadata"
 )
 
 // Provider is the interface for managing the bootstrap source pool and its instance template.
@@ -72,7 +74,7 @@ const (
 	// RUNNING cluster pool is available.
 	KarpenterFallbackNodePoolTemplate          = "karpenter-fallback"
 	KarpenterFallbackNodePoolTemplateImageType = "COS_CONTAINERD"
-	clusterNameMetadataKey                     = "cluster-name"
+	clusterNameMetadataKey                     = metadata.ClusterNameKey
 	nodePoolNameLabelKey                       = "goog-k8s-node-pool-name"
 )
 
@@ -219,22 +221,7 @@ func (p *DefaultProvider) getSourcePoolName(_ context.Context) (string, error) {
 
 // namesCluster reports whether instance template metadata identifies the given cluster.
 func namesCluster(meta *compute.Metadata, clusterName string) bool {
-	return hasMetadataValue(meta, clusterNameMetadataKey, clusterName)
-}
-
-// hasMetadataValue reports whether the metadata carries the given key with the given value.
-//
-//nolint:unparam // generic by design; every caller happens to pass clusterNameMetadataKey today.
-func hasMetadataValue(meta *compute.Metadata, key, value string) bool {
-	if meta == nil {
-		return false
-	}
-	for _, item := range meta.Items {
-		if item != nil && item.Key == key && item.Value != nil && *item.Value == value {
-			return true
-		}
-	}
-	return false
+	return metadata.HasValue(meta, clusterNameMetadataKey, clusterName)
 }
 
 // ensureKarpenterNodePoolTemplate creates the fallback pool if it does not already exist.

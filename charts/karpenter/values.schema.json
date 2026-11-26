@@ -437,6 +437,12 @@
               "description": "Default GCP service account email to attach to provisioned nodes. Overrides the Compute Engine default SA. Leave empty to use the Compute Engine default SA.",
               "default": ""
             },
+            "provisionMode": {
+              "type": "string",
+              "enum": ["gke", "self-hosted"],
+              "description": "Provision mode for the cluster: gke (default) or self-hosted. In self-hosted mode node bootstrap is owned by GCENodeClass spec.startupScript (or baked into the image) and the Container API is never called.",
+              "default": "gke"
+            },
             "quotaExceededTTL": {
               "type": "string",
               "description": "How long an instance type stays unavailable in the region after a QUOTA_EXCEEDED launch failure (e.g. 1h). Leave empty for the controller default of 30m; 0s disables quota backoff.",

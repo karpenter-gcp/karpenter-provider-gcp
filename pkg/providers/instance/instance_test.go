@@ -1130,7 +1130,7 @@ func TestRenderDiskProperties_InheritsNodeClassLabels(t *testing.T) {
 		require.Equal(t, wantLabels, disk.InitializeParams.Labels)
 	}
 	instance := &compute.Instance{Labels: make(map[string]string)}
-	p.setupInstanceLabels(instance, nodeClaim, nodeClass, "", 0)
+	p.setupInstanceLabels(instance, nodeClaim, nodeClass, 0)
 	for _, key := range []string{utils.LabelClusterNameKey, utils.LabelClusterLocationKey} {
 		require.Equal(t, instance.Labels[key], disks[0].InitializeParams.Labels[key])
 		require.Equal(t, instance.Labels[key], disks[1].InitializeParams.Labels[key])
@@ -2678,7 +2678,7 @@ func TestSetupInstanceLabels_StampsClusterLocation(t *testing.T) {
 	p := &DefaultProvider{clusterName: "my-cluster", clusterLocation: "us-central1-f"}
 	inst, nodeClaim, nodeClass := instanceLabelsFixture()
 
-	p.setupInstanceLabels(inst, nodeClaim, nodeClass, "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", 0)
+	p.setupInstanceLabels(inst, nodeClaim, nodeClass, 0)
 
 	locationKey := utils.SanitizeGCELabelValue(utils.LabelClusterLocationKey)
 	require.Equal(t, "us-central1-f", inst.Labels[locationKey],
@@ -2693,7 +2693,7 @@ func TestSetupInstanceLabels_StampsLocalSSDCount(t *testing.T) {
 		p := &DefaultProvider{clusterName: "my-cluster", clusterLocation: "us-central1-f"}
 		inst, nodeClaim, nodeClass := instanceLabelsFixture()
 
-		p.setupInstanceLabels(inst, nodeClaim, nodeClass, "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", count)
+		p.setupInstanceLabels(inst, nodeClaim, nodeClass, count)
 
 		require.Equal(t, strconv.Itoa(count), inst.Labels[countKey],
 			"local-SSD count %d must be stamped on the instance label %q", count, countKey)
@@ -2743,7 +2743,7 @@ func TestSetupInstanceLabels_ClusterNameNotOverwrittenByRequirements(t *testing.
 
 	p := &DefaultProvider{clusterName: "real-cluster", clusterLocation: "us-central1-f"}
 	inst, nodeClaim, nodeClass := instanceLabelsFixture()
-	p.setupInstanceLabels(inst, nodeClaim, nodeClass, "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", 0)
+	p.setupInstanceLabels(inst, nodeClaim, nodeClass, 0)
 
 	nameKey := utils.SanitizeGCELabelValue(utils.LabelClusterNameKey)
 	require.Equal(t, "real-cluster", inst.Labels[nameKey],
@@ -2755,7 +2755,7 @@ func TestSetupInstanceLabels_ClusterLocationNotOverwrittenByRequirements(t *test
 
 	p := &DefaultProvider{clusterName: "my-cluster", clusterLocation: "us-central1-f"}
 	inst, nodeClaim, nodeClass := instanceLabelsFixture()
-	p.setupInstanceLabels(inst, nodeClaim, nodeClass, "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", 0)
+	p.setupInstanceLabels(inst, nodeClaim, nodeClass, 0)
 
 	locationKey := utils.SanitizeGCELabelValue(utils.LabelClusterLocationKey)
 	require.Equal(t, "us-central1-f", inst.Labels[locationKey],
@@ -2855,6 +2855,69 @@ func TestBelongsToCluster(t *testing.T) {
 			require.Equal(t, tc.want, p.belongsToCluster(inst), tc.name)
 		})
 	}
+}
+
+// TestSyncInstances_AdmitsOnlyExactClusterNameMetadata proves the sanitized label filter
+// is only coarse: sanitization is lossy (a.b.com and a-b.com both map to a-b-com), so an
+// instance is admitted only when its cluster-name metadata equals the exact cluster
+// name. syncInstances never consults the provision mode, so this single test covers both
+// gke and self-hosted deployments.
+func TestSyncInstances_AdmitsOnlyExactClusterNameMetadata(t *testing.T) {
+	t.Parallel()
+
+	clusterNameMetadata := func(value string) *compute.Metadata {
+		return &compute.Metadata{Items: []*compute.MetadataItems{
+			{Key: metadata.ClusterNameKey, Value: ptr.To(value)},
+		}}
+	}
+	// All three instances carry the same sanitized label, so the server-side filter
+	// returns all of them; only the exact metadata match may survive.
+	labels := map[string]string{
+		utils.SanitizeGCELabelValue(utils.LabelClusterNameKey): utils.SanitizeGCELabelValue("a-b.com"),
+	}
+	gceInstance := func(name string, md *compute.Metadata) *compute.Instance {
+		return &compute.Instance{
+			Name:              name,
+			MachineType:       "zones/us-central1-a/machineTypes/e2-standard-2",
+			CreationTimestamp: "2026-07-01T00:00:00Z",
+			Status:            InstanceStatusRunning,
+			Labels:            labels,
+			Metadata:          md,
+		}
+	}
+
+	var gotFilter string
+	p := newFakeComputeProvider(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/projects/test-project/regions/us-central1"):
+			writeJSON(w, &compute.Region{Zones: []string{"projects/test-project/zones/us-central1-a"}})
+		case strings.HasSuffix(r.URL.Path, "/projects/test-project/zones/us-central1-a/instances"):
+			gotFilter = r.URL.Query().Get("filter")
+			writeJSON(w, &compute.InstanceList{Items: []*compute.Instance{
+				gceInstance("exact-match", clusterNameMetadata("a-b.com")),
+				gceInstance("sanitized-collision", clusterNameMetadata("a.b.com")),
+				gceInstance("missing-metadata-key", &compute.Metadata{}),
+				gceInstance("nil-metadata", nil),
+			}})
+		default:
+			t.Errorf("unexpected API call: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	p.clusterName = "a-b.com"
+
+	require.NoError(t, p.syncInstances(context.Background()))
+	require.Contains(t, gotFilter, "labels.goog-k8s-cluster-name:a-b-com")
+
+	require.Equal(t, 1, p.instanceCache.ItemCount())
+	_, ok := p.instanceCache.Get("exact-match")
+	require.True(t, ok)
+
+	// Upgrade compatibility: valid GKE cluster names with consecutive hyphens
+	// must query the verbatim label rather than collapsing "--" to "-".
+	p.clusterName = "prod--east"
+	require.NoError(t, p.syncInstances(context.Background()))
+	require.Contains(t, gotFilter, "labels.goog-k8s-cluster-name:prod--east")
 }
 
 func TestBuildInstanceTags(t *testing.T) {

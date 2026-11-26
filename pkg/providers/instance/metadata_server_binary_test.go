@@ -29,6 +29,7 @@ import (
 
 	"github.com/karpenter-gcp/karpenter-provider-gcp/pkg/apis/v1alpha1"
 	"github.com/karpenter-gcp/karpenter-provider-gcp/pkg/metadata"
+	"github.com/karpenter-gcp/karpenter-provider-gcp/pkg/operator/options"
 )
 
 // Metadata/disk policy tests supply an already resolved launch; fetching and
@@ -92,4 +93,21 @@ func TestResolveLaunchImageDoesNotFallBackOnArtifactFailure(t *testing.T) {
 	_, err := provider.resolveLaunchImage(context.Background(), class, makeNonGPUIT())
 	require.ErrorIs(t, err, failure)
 	require.False(t, cloudprovider.IsInsufficientCapacityError(err))
+}
+
+func TestResolveLaunchImageSelfHostedSkipsBootstrapProvider(t *testing.T) {
+	class := &v1alpha1.GCENodeClass{Status: v1alpha1.GCENodeClassStatus{Images: []v1alpha1.Image{
+		{SourceImage: "projects/my-project/global/images/custom-kops-image"},
+	}}}
+	ctx := options.ToContext(context.Background(), &options.Options{
+		ProvisionMode: options.ProvisionModeSelfHosted,
+	})
+	provider := &DefaultProvider{bootstrapProvider: bootstrapFunc(func(context.Context, string, string) (metadata.BootstrapRelease, error) {
+		t.Fatal("bootstrapProvider.Get must not be called in self-hosted mode")
+		return metadata.BootstrapRelease{}, nil
+	})}
+	selected, err := provider.resolveLaunchImage(ctx, class, makeNonGPUIT())
+	require.NoError(t, err)
+	require.Equal(t, "projects/my-project/global/images/custom-kops-image", selected.SourceImage)
+	require.Empty(t, selected.Bootstrap.Version)
 }

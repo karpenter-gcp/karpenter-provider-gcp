@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strings"
 	"testing"
@@ -559,4 +560,146 @@ func TestGCENodeClassSwapConfigDeepCopyKeepsAutomaticSize(t *testing.T) {
 	require.Equal(t, int64(8), copied.BootDiskSwapRequestedGiB())
 	require.False(t, copied.BootDiskSwapEncrypted())
 	require.Nil(t, (&GCENodeClass{}).BootDiskSwapConfig())
+}
+
+func validSelfHostedSpec() map[string]any {
+	return map[string]any{
+		"startupScript":        "#!/bin/bash\necho bootstrap\n",
+		"kubeletConfiguration": map[string]any{"maxPods": int64(110)},
+		"networkConfig":        map[string]any{"subnetwork": "projects/p/regions/us-central1/subnetworks/nodes"},
+		"imageSelectorTerms":   []any{map[string]any{"id": "projects/p/global/images/node-img"}},
+		"disks":                []any{map[string]any{"boot": true, "sizeGiB": int64(100)}},
+	}
+}
+
+func TestGCENodeClassCRDStartupScriptValidation(t *testing.T) {
+	requireAdmitted(t, validSelfHostedSpec())
+
+	// Allowed binpacking kubeletConfiguration fields are accepted alongside startupScript.
+	withBinpacking := validSelfHostedSpec()
+	withBinpacking["kubeletConfiguration"] = map[string]any{
+		"maxPods":        int64(110),
+		"podsPerCore":    int64(10),
+		"systemReserved": map[string]any{"cpu": "100m"},
+		"kubeReserved":   map[string]any{"memory": "256Mi"},
+		"evictionHard":   map[string]any{"memory.available": "100Mi"},
+	}
+	requireAdmitted(t, withBinpacking)
+
+	// Extra data disks that omit the optional boot key are accepted alongside a boot disk.
+	withDataDisk := validSelfHostedSpec()
+	withDataDisk["disks"] = []any{
+		map[string]any{"sizeGiB": int64(200)},
+		map[string]any{"boot": true, "sizeGiB": int64(100)},
+	}
+	requireAdmitted(t, withDataDisk)
+
+	cases := []struct {
+		name    string
+		mutate  func(map[string]any)
+		message string
+	}{
+		{
+			name:    "missing maxPods",
+			mutate:  func(s map[string]any) { delete(s, "kubeletConfiguration") },
+			message: "startupScript requires kubeletConfiguration.maxPods to be set and >= 1",
+		},
+		{
+			name:    "zero maxPods",
+			mutate:  func(s map[string]any) { s["kubeletConfiguration"] = map[string]any{"maxPods": int64(0)} },
+			message: "startupScript requires kubeletConfiguration.maxPods to be set and >= 1",
+		},
+		{
+			name:    "missing subnetwork",
+			mutate:  func(s map[string]any) { delete(s, "networkConfig") },
+			message: "startupScript requires networkConfig.subnetwork to be set",
+		},
+		{
+			name: "non-id image term",
+			mutate: func(s map[string]any) {
+				s["imageSelectorTerms"] = []any{map[string]any{"family": "ContainerOptimizedOS", "version": "latest"}}
+			},
+			message: "startupScript requires every imageSelectorTerms entry to use id",
+		},
+		{
+			name:    "disk without boot key returns friendly message",
+			mutate:  func(s map[string]any) { s["disks"] = []any{map[string]any{"sizeGiB": int64(100)}} },
+			message: "startupScript requires disks to contain a boot disk",
+		},
+		{
+			name:    "autoGPUTaint true rejected",
+			mutate:  func(s map[string]any) { s["autoGPUTaint"] = true },
+			message: "startupScript does not support autoGPUTaint",
+		},
+		{
+			name: "linuxNodeConfig rejected",
+			mutate: func(s map[string]any) {
+				s["linuxNodeConfig"] = map[string]any{"swapConfig": map[string]any{"enabled": true}}
+			},
+			message: "startupScript does not support linuxNodeConfig",
+		},
+		{
+			name: "gpuSharingConfig rejected",
+			mutate: func(s map[string]any) {
+				s["gpuSharingConfig"] = map[string]any{"strategy": "TimeSharing", "maxSharedClientsPerGPU": int64(2)}
+			},
+			message: "startupScript does not support gpuSharingConfig",
+		},
+		{
+			name: "secondaryBootImage rejected",
+			mutate: func(s map[string]any) {
+				s["disks"] = append(s["disks"].([]any), map[string]any{"sizeGiB": int64(50), "secondaryBootImage": "global/images/cache"})
+			},
+			message: "startupScript does not support disks with secondaryBootImage or secondaryBootMode",
+		},
+		{
+			name: "secondaryBootMode rejected",
+			mutate: func(s map[string]any) {
+				s["disks"] = append(s["disks"].([]any), map[string]any{"sizeGiB": int64(50), "secondaryBootMode": "CONTAINER_IMAGE_CACHE"})
+			},
+			message: "startupScript does not support disks with secondaryBootImage or secondaryBootMode",
+		},
+		{
+			name: "node-delivery-only kubeletConfiguration field rejected",
+			mutate: func(s map[string]any) {
+				s["kubeletConfiguration"].(map[string]any)["cpuManagerPolicy"] = "static"
+			},
+			message: "startupScript only supports binpacking kubeletConfiguration fields",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			spec := validSelfHostedSpec()
+			tc.mutate(spec)
+			requireRejected(t, spec, tc.message)
+		})
+	}
+}
+
+// TestGCENodeClassCRDStartupScriptKubeletRuleIsExhaustive ensures every field on
+// KubeletConfiguration is either in the binpacking allowlist or rejected by the
+// startupScript CEL rule, so newly added kubelet fields cannot slip past silently.
+func TestGCENodeClassCRDStartupScriptKubeletRuleIsExhaustive(t *testing.T) {
+	allowed := map[string]bool{
+		"maxPods": true, "podsPerCore": true,
+		"systemReserved": true, "kubeReserved": true, "evictionHard": true,
+	}
+	var rule string
+	for _, v := range specSchema(t).XValidations {
+		if strings.Contains(v.Message, "binpacking kubeletConfiguration fields") {
+			rule = v.Rule
+		}
+	}
+	require.NotEmpty(t, rule)
+	typ := reflect.TypeFor[KubeletConfiguration]()
+	for i := range typ.NumField() {
+		jsonName := strings.Split(typ.Field(i).Tag.Get("json"), ",")[0]
+		if allowed[jsonName] {
+			require.NotContains(t, rule, "self.kubeletConfiguration."+jsonName)
+		} else {
+			require.Contains(t, rule, "!has(self.kubeletConfiguration."+jsonName+")",
+				"new KubeletConfiguration field %q must be classified as binpacking-allowed or rejected by the startupScript CEL rule", jsonName)
+		}
+	}
 }

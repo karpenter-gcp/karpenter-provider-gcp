@@ -35,6 +35,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 
 	"github.com/karpenter-gcp/karpenter-provider-gcp/pkg/apis/v1alpha1"
+	"github.com/karpenter-gcp/karpenter-provider-gcp/pkg/operator/options"
 	"github.com/karpenter-gcp/karpenter-provider-gcp/pkg/providers/gke"
 	versionprovider "github.com/karpenter-gcp/karpenter-provider-gcp/pkg/providers/version"
 )
@@ -104,6 +105,18 @@ func NewDefaultProvider(computeService *compute.Service, versionProvider version
 
 // List caches non-empty successful resolutions per selector; failures and empty results retry.
 func (p *DefaultProvider) List(ctx context.Context, nodeClass *v1alpha1.GCENodeClass) (Images, error) {
+	// Self-hosted mode accepts only explicit image IDs; other terms need GKE resolution
+	// and are terminal configuration errors. Gate before the cache so no GKE call is
+	// made and no cached result bypasses the restriction.
+	selfHosted := options.FromContext(ctx).IsSelfHosted()
+	if selfHosted {
+		for _, term := range nodeClass.Spec.ImageSelectorTerms {
+			if term.ID == "" {
+				return nil, &imageResolutionError{msg: "only id: imageSelectorTerms are supported in self-hosted mode"}
+			}
+		}
+	}
+
 	p.Lock()
 	defer p.Unlock()
 
@@ -123,9 +136,13 @@ func (p *DefaultProvider) List(ctx context.Context, nodeClass *v1alpha1.GCENodeC
 		if err != nil {
 			return nil, err
 		}
-		masterVersion, err = p.setBootstrapVersions(ctx, imgs, masterVersion)
-		if err != nil {
-			return nil, err
+		// Self-hosted nodes never fetch GKE bootstrap bundles, so skip release decoding
+		// and API-server version lookups.
+		if !selfHosted {
+			masterVersion, err = p.setBootstrapVersions(ctx, imgs, masterVersion)
+			if err != nil {
+				return nil, err
+			}
 		}
 		result = append(result, imgs...)
 	}
@@ -169,7 +186,11 @@ func (p *DefaultProvider) resolveAliasTerm(ctx context.Context, term v1alpha1.Im
 }
 
 func (p *DefaultProvider) resolveIDTerm(ctx context.Context, term v1alpha1.ImageSelectorTerm) (Images, error) {
-	img, err := p.resolveImage(ctx, term.ID)
+	projectID, imageName, err := parseImageSource(term.ID)
+	if err != nil {
+		return nil, fmt.Errorf("resolving image %q: %w", term.ID, err)
+	}
+	img, err := lookupImage(ctx, p.computeService, projectID, imageName)
 	if err != nil {
 		return nil, fmt.Errorf("resolving image %q: %w", term.ID, err)
 	}
@@ -193,7 +214,10 @@ func (p *DefaultProvider) resolveIDTerm(ctx context.Context, term v1alpha1.Image
 	default:
 		return nil, fmt.Errorf("unsupported architecture %q for image %q", img.Architecture, term.ID)
 	}
-	return Images{{SourceImage: term.ID, Requirements: requirements}}, nil
+	// Publish the canonical project-relative path so switching between partial paths and
+	// full Compute URLs for the same image does not trigger false ImageDrift.
+	sourceImage := fmt.Sprintf("projects/%s/global/images/%s", projectID, imageName)
+	return Images{{SourceImage: sourceImage, Requirements: requirements}}, nil
 }
 
 func (p *DefaultProvider) resolveFamilyTerm(ctx context.Context, term v1alpha1.ImageSelectorTerm) (Images, error) {
@@ -349,12 +373,19 @@ func isImageNotFound(err error) bool {
 
 // parseImageSource parses a GCP image source string
 // Supports formats like:
+// - https://www.googleapis.com/compute/v1/projects/PROJECT_ID/global/images/IMAGE_NAME
 // - projects/PROJECT_ID/global/images/IMAGE_NAME
 // - global/images/IMAGE_NAME (requires project context)
 // - IMAGE_NAME (requires project context)
 func parseImageSource(imageSource string) (projectID, imageName string, err error) {
 	// Remove any leading/trailing whitespace
 	imageSource = strings.TrimSpace(imageSource)
+	for _, prefix := range []string{
+		"https://www.googleapis.com/compute/v1/",
+		"https://compute.googleapis.com/compute/v1/",
+	} {
+		imageSource = strings.TrimPrefix(imageSource, prefix)
+	}
 
 	// Pattern: projects/PROJECT_ID/global/images/IMAGE_NAME
 	projectPattern := regexp.MustCompile(`^projects/([^/]+)/global/images/(.+)$`)

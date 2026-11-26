@@ -25,6 +25,7 @@ import (
 
 	"github.com/karpenter-gcp/karpenter-provider-gcp/pkg/apis/v1alpha1"
 	"github.com/karpenter-gcp/karpenter-provider-gcp/pkg/metadata"
+	"github.com/karpenter-gcp/karpenter-provider-gcp/pkg/operator/options"
 	"github.com/karpenter-gcp/karpenter-provider-gcp/pkg/providers/imagefamily"
 )
 
@@ -39,6 +40,9 @@ func (p *DefaultProvider) resolveLaunchImage(ctx context.Context, nodeClass *v1a
 	image, found := imagefamily.FindImage(nodeClass.Status.Images, instanceType.Requirements)
 	if !found {
 		return launchImage{}, fmt.Errorf("no target image found for node class %s", nodeClass.Name)
+	}
+	if options.FromContext(ctx).IsSelfHosted() {
+		return launchImage{SourceImage: image.SourceImage}, nil
 	}
 	if image.KubernetesVersion == "" {
 		return launchImage{}, fmt.Errorf("resolved image has no kubernetesVersion; update CRDs and wait for GCENodeClass image reconciliation")

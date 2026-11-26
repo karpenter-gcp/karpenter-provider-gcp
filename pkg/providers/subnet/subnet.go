@@ -56,11 +56,12 @@ type SubnetworksClient interface {
 }
 
 type DefaultProvider struct {
-	client SubnetworksClient
-	region string
-	clock  clock.PassiveClock
-	mu     sync.Mutex
-	cache  map[subnetworkRef]snapshot
+	client    SubnetworksClient
+	projectID string
+	region    string
+	clock     clock.PassiveClock
+	mu        sync.Mutex
+	cache     map[subnetworkRef]snapshot
 }
 
 type snapshot struct {
@@ -70,8 +71,8 @@ type snapshot struct {
 	expiresAt     time.Time
 }
 
-func NewProvider(client SubnetworksClient, region string, clock clock.PassiveClock) Provider {
-	return &DefaultProvider{client: client, region: region, clock: clock, cache: map[subnetworkRef]snapshot{}}
+func NewProvider(client SubnetworksClient, projectID, region string, clock clock.PassiveClock) Provider {
+	return &DefaultProvider{client: client, projectID: projectID, region: region, clock: clock, cache: map[subnetworkRef]snapshot{}}
 }
 
 func (p *DefaultProvider) GetFreeIPCounts(ctx context.Context, network, subnetwork string) (map[string]int64, error) {
@@ -88,7 +89,7 @@ func (p *DefaultProvider) getSnapshot(ctx context.Context, network, subnetwork s
 	if err := ctx.Err(); err != nil {
 		return snapshot{}, err
 	}
-	target, err := resolveTarget(network, subnetwork, p.region)
+	target, err := resolveTarget(network, subnetwork, p.projectID, p.region)
 	if err != nil {
 		return snapshot{}, err
 	}
@@ -136,7 +137,7 @@ func (p *DefaultProvider) getSnapshot(ctx context.Context, network, subnetwork s
 
 // Invalidate discards cached configuration and range counts for the affected subnetwork.
 func (p *DefaultProvider) Invalidate(network, subnetwork string) {
-	target, err := resolveTarget(network, subnetwork, p.region)
+	target, err := resolveTarget(network, subnetwork, p.projectID, p.region)
 	if err != nil {
 		return
 	}
@@ -174,7 +175,18 @@ func resourceParts(raw string) ([]string, error) {
 	return parts, nil
 }
 
-func resolveTarget(network, subnetwork, region string) (subnetworkRef, error) {
+// CanonicalSubnetworkRef normalizes a bare name, regional path, project-qualified
+// path, or full Compute URL to projects/{project}/regions/{region}/subnetworks/{name}.
+// When network is non-empty, its project is used for relative subnetwork refs.
+func CanonicalSubnetworkRef(network, subnetwork, defaultProject, defaultRegion string) (string, error) {
+	ref, err := resolveTarget(network, subnetwork, defaultProject, defaultRegion)
+	if err != nil {
+		return "", err
+	}
+	return ref.String(), nil
+}
+
+func resolveTarget(network, subnetwork, defaultProject, region string) (subnetworkRef, error) {
 	parts, err := resourceParts(subnetwork)
 	if err != nil {
 		return subnetworkRef{}, err
@@ -182,9 +194,9 @@ func resolveTarget(network, subnetwork, region string) (subnetworkRef, error) {
 	if len(parts) == 6 && parts[0] == "projects" && parts[2] == "regions" && parts[4] == "subnetworks" {
 		return subnetworkRef{project: parts[1], region: parts[3], name: parts[5]}, nil
 	}
-	project, err := networkProject(network)
+	project, err := resolveTargetProject(network, subnetwork, defaultProject)
 	if err != nil {
-		return subnetworkRef{}, fmt.Errorf("resolving subnetwork %q: %w", subnetwork, err)
+		return subnetworkRef{}, err
 	}
 	switch {
 	case len(parts) == 1:
@@ -194,6 +206,20 @@ func resolveTarget(network, subnetwork, region string) (subnetworkRef, error) {
 	default:
 		return subnetworkRef{}, fmt.Errorf("invalid subnetwork reference %q", subnetwork)
 	}
+}
+
+func resolveTargetProject(network, subnetwork, defaultProject string) (string, error) {
+	if network != "" {
+		project, err := networkProject(network)
+		if err != nil {
+			return "", fmt.Errorf("resolving subnetwork %q: %w", subnetwork, err)
+		}
+		return project, nil
+	}
+	if defaultProject != "" {
+		return defaultProject, nil
+	}
+	return "", fmt.Errorf("resolving subnetwork %q: network is empty and no default project is configured", subnetwork)
 }
 
 func networkProject(network string) (string, error) {

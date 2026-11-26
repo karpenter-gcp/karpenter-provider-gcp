@@ -33,6 +33,15 @@ import (
 // +kubebuilder:validation:XValidation:message="memorySwap.swapBehavior LimitedSwap requires kubeletConfiguration.failSwapOn to be explicitly set to false unless linuxNodeConfig.swapConfig is enabled",rule="!has(self.kubeletConfiguration) || !has(self.kubeletConfiguration.memorySwap) || !has(self.kubeletConfiguration.memorySwap.swapBehavior) || self.kubeletConfiguration.memorySwap.swapBehavior != 'LimitedSwap' || (has(self.linuxNodeConfig) && has(self.linuxNodeConfig.swapConfig) && has(self.linuxNodeConfig.swapConfig.enabled) && self.linuxNodeConfig.swapConfig.enabled) || (has(self.kubeletConfiguration.failSwapOn) && self.kubeletConfiguration.failSwapOn == false)"
 // +kubebuilder:validation:XValidation:message="linuxNodeConfig.swapConfig.bootDiskProfile.swapSizeGib must be at most half of the boot disk sizeGiB",rule="!has(self.linuxNodeConfig) || !has(self.linuxNodeConfig.swapConfig) || !has(self.linuxNodeConfig.swapConfig.bootDiskProfile) || !has(self.linuxNodeConfig.swapConfig.bootDiskProfile.swapSizeGib) || !has(self.disks) || self.disks.all(d, !has(d.boot) || !d.boot || !has(d.sizeGiB) || 2 * self.linuxNodeConfig.swapConfig.bootDiskProfile.swapSizeGib <= d.sizeGiB)"
 // +kubebuilder:validation:XValidation:message="linuxNodeConfig.swapConfig.bootDiskProfile.swapSizeGib must be at most 50GiB when the provider creates the default 100GiB boot disk",rule="!has(self.linuxNodeConfig) || !has(self.linuxNodeConfig.swapConfig) || !has(self.linuxNodeConfig.swapConfig.bootDiskProfile) || !has(self.linuxNodeConfig.swapConfig.bootDiskProfile.swapSizeGib) || (has(self.disks) && self.disks.exists(d, has(d.boot) && d.boot)) || self.linuxNodeConfig.swapConfig.bootDiskProfile.swapSizeGib <= 50"
+// +kubebuilder:validation:XValidation:message="startupScript requires kubeletConfiguration.maxPods to be set and >= 1",rule="!has(self.startupScript) || (has(self.kubeletConfiguration) && has(self.kubeletConfiguration.maxPods) && self.kubeletConfiguration.maxPods >= 1)"
+// +kubebuilder:validation:XValidation:message="startupScript requires networkConfig.subnetwork to be set",rule="!has(self.startupScript) || (has(self.networkConfig) && has(self.networkConfig.subnetwork) && self.networkConfig.subnetwork.size() > 0)"
+// +kubebuilder:validation:XValidation:message="startupScript requires every imageSelectorTerms entry to use id",rule="!has(self.startupScript) || self.imageSelectorTerms.all(t, has(t.id))"
+// +kubebuilder:validation:XValidation:message="startupScript requires disks to contain a boot disk",rule="!has(self.startupScript) || (has(self.disks) && self.disks.exists(d, has(d.boot) && d.boot))"
+// +kubebuilder:validation:XValidation:message="startupScript only supports binpacking kubeletConfiguration fields (maxPods, podsPerCore, systemReserved, kubeReserved, evictionHard)",rule="!has(self.startupScript) || !has(self.kubeletConfiguration) || (!has(self.kubeletConfiguration.clusterDNS) && !has(self.kubeletConfiguration.evictionSoft) && !has(self.kubeletConfiguration.evictionSoftGracePeriod) && !has(self.kubeletConfiguration.evictionMaxPodGracePeriod) && !has(self.kubeletConfiguration.imageGCHighThresholdPercent) && !has(self.kubeletConfiguration.imageGCLowThresholdPercent) && !has(self.kubeletConfiguration.cpuCFSQuota) && !has(self.kubeletConfiguration.cpuManagerPolicy) && !has(self.kubeletConfiguration.serializeImagePulls) && !has(self.kubeletConfiguration.maxParallelImagePulls) && !has(self.kubeletConfiguration.failSwapOn) && !has(self.kubeletConfiguration.memorySwap) && !has(self.kubeletConfiguration.shutdownGracePeriod) && !has(self.kubeletConfiguration.shutdownGracePeriodCriticalPods))"
+// +kubebuilder:validation:XValidation:message="startupScript does not support autoGPUTaint",rule="!has(self.startupScript) || !has(self.autoGPUTaint) || !self.autoGPUTaint"
+// +kubebuilder:validation:XValidation:message="startupScript does not support disks with secondaryBootImage or secondaryBootMode",rule="!has(self.startupScript) || !has(self.disks) || self.disks.all(d, !has(d.secondaryBootImage) && !has(d.secondaryBootMode))"
+// +kubebuilder:validation:XValidation:message="startupScript does not support linuxNodeConfig",rule="!has(self.startupScript) || !has(self.linuxNodeConfig)"
+// +kubebuilder:validation:XValidation:message="startupScript does not support gpuSharingConfig",rule="!has(self.startupScript) || !has(self.gpuSharingConfig)"
 type GCENodeClassSpec struct {
 	// ServiceAccount is the GCP IAM service account email to assign to the instance
 	// +kubebuilder:validation:Pattern=`^[^@]+@(developer\.gserviceaccount\.com|[^@]+\.iam\.gserviceaccount\.com)$`
@@ -156,6 +165,12 @@ type GCENodeClassSpec struct {
 	// Disabled by default to preserve backward compatibility.
 	// +optional
 	AutoGPUTaint bool `json:"autoGPUTaint,omitempty"`
+	// StartupScript is written verbatim to the instance's "startup-script" metadata key and
+	// owns node bootstrap end to end. Only valid with PROVISION_MODE=self-hosted.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=131072
+	// +optional
+	StartupScript *string `json:"startupScript,omitempty"`
 	// GPUDriverVersion controls which NVIDIA driver version GKE installs on GPU nodes.
 	// Mirrors the GKE node pool gpu_driver_installation_config.gpu_driver_version field.
 	// Valid values: "default" (GKE-recommended stable), "latest" (newest, COS only),
@@ -289,6 +304,7 @@ type ImageSelectorTerm struct {
 	Alias string `json:"alias,omitempty"`
 	// ID specifies a GKE image by its full resource URL.
 	// +kubebuilder:validation:XValidation:message="'id' is improperly formatted, must match the format 'id'",rule="self.matches('^.*$')"
+	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=160
 	// +optional
 	ID string `json:"id,omitempty"`

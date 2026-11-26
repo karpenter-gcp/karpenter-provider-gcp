@@ -310,6 +310,7 @@ spec:
                     id:
                       description: ID specifies a GKE image by its full resource URL.
                       maxLength: 160
+                      minLength: 1
                       type: string
                       x-kubernetes-validations:
                       - message: '''id'' is improperly formatted, must match the format
@@ -844,6 +845,13 @@ spec:
                       enabled.
                     type: boolean
                 type: object
+              startupScript:
+                description: |-
+                  StartupScript is written verbatim to the instance's "startup-script" metadata key and
+                  owns node bootstrap end to end. Only valid with PROVISION_MODE=self-hosted.
+                maxLength: 131072
+                minLength: 1
+                type: string
               subnetRangeName:
                 description: |-
                   SubnetRangeName is the name of the subnetwork secondary IPv4 range from which
@@ -911,6 +919,41 @@ spec:
                 || (has(self.disks) && self.disks.exists(d, has(d.boot) && d.boot))
                 || self.linuxNodeConfig.swapConfig.bootDiskProfile.swapSizeGib <=
                 50'
+            - message: startupScript requires kubeletConfiguration.maxPods to be set
+                and >= 1
+              rule: '!has(self.startupScript) || (has(self.kubeletConfiguration) &&
+                has(self.kubeletConfiguration.maxPods) && self.kubeletConfiguration.maxPods
+                >= 1)'
+            - message: startupScript requires networkConfig.subnetwork to be set
+              rule: '!has(self.startupScript) || (has(self.networkConfig) && has(self.networkConfig.subnetwork)
+                && self.networkConfig.subnetwork.size() > 0)'
+            - message: startupScript requires every imageSelectorTerms entry to use
+                id
+              rule: '!has(self.startupScript) || self.imageSelectorTerms.all(t, has(t.id))'
+            - message: startupScript requires disks to contain a boot disk
+              rule: '!has(self.startupScript) || (has(self.disks) && self.disks.exists(d,
+                has(d.boot) && d.boot))'
+            - message: startupScript only supports binpacking kubeletConfiguration
+                fields (maxPods, podsPerCore, systemReserved, kubeReserved, evictionHard)
+              rule: '!has(self.startupScript) || !has(self.kubeletConfiguration) ||
+                (!has(self.kubeletConfiguration.clusterDNS) && !has(self.kubeletConfiguration.evictionSoft)
+                && !has(self.kubeletConfiguration.evictionSoftGracePeriod) && !has(self.kubeletConfiguration.evictionMaxPodGracePeriod)
+                && !has(self.kubeletConfiguration.imageGCHighThresholdPercent) &&
+                !has(self.kubeletConfiguration.imageGCLowThresholdPercent) && !has(self.kubeletConfiguration.cpuCFSQuota)
+                && !has(self.kubeletConfiguration.cpuManagerPolicy) && !has(self.kubeletConfiguration.serializeImagePulls)
+                && !has(self.kubeletConfiguration.maxParallelImagePulls) && !has(self.kubeletConfiguration.failSwapOn)
+                && !has(self.kubeletConfiguration.memorySwap) && !has(self.kubeletConfiguration.shutdownGracePeriod)
+                && !has(self.kubeletConfiguration.shutdownGracePeriodCriticalPods))'
+            - message: startupScript does not support autoGPUTaint
+              rule: '!has(self.startupScript) || !has(self.autoGPUTaint) || !self.autoGPUTaint'
+            - message: startupScript does not support disks with secondaryBootImage
+                or secondaryBootMode
+              rule: '!has(self.startupScript) || !has(self.disks) || self.disks.all(d,
+                !has(d.secondaryBootImage) && !has(d.secondaryBootMode))'
+            - message: startupScript does not support linuxNodeConfig
+              rule: '!has(self.startupScript) || !has(self.linuxNodeConfig)'
+            - message: startupScript does not support gpuSharingConfig
+              rule: '!has(self.startupScript) || !has(self.gpuSharingConfig)'
           status:
             description: GCENodeClassStatus contains the resolved state of the GCENodeClass
             properties:

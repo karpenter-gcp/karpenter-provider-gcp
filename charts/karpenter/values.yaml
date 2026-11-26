@@ -188,6 +188,10 @@ controller:
     # Recommended: set to a dedicated SA with roles/container.nodeServiceAccount.
     # Can be overridden per-NodeClass via GCENodeClass.spec.serviceAccount.
     defaultNodepoolServiceAccount: ""
+    # -- Provision mode for the cluster: `gke` (default) or `self-hosted`. In `self-hosted` mode
+    # node bootstrap is owned by `GCENodeClass.spec.startupScript` (or baked into the image) and
+    # the Container API is never called. Corresponds to the PROVISION_MODE env var.
+    provisionMode: "gke"
     # -- How long an instance type stays unavailable in the region after a launch fails with
     # QUOTA_EXCEEDED (e.g. `1h`). Leave empty for the controller default of 30m; set to `0s`
     # to disable quota backoff. Corresponds to the QUOTA_EXCEEDED_TTL env var.

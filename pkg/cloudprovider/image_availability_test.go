@@ -96,6 +96,7 @@ func imagesReadyNodeClass(images ...v1alpha1.Image) *v1alpha1.GCENodeClass {
 		Status:     v1alpha1.GCENodeClassStatus{Images: images},
 	}
 	nodeClass.StatusConditions().SetTrue(v1alpha1.ConditionTypeImagesReady)
+	nodeClass.StatusConditions().SetTrue(v1alpha1.ConditionTypeConfigurationReady)
 	return nodeClass
 }
 
@@ -319,6 +320,7 @@ func TestCreateWithPartialImages(t *testing.T) {
 						CreationTimestamp: "2025-04-01T00:00:00Z",
 						Status:            "RUNNING",
 						Scheduling:        &compute.Scheduling{ProvisioningModel: "SPOT"},
+						Metadata:          &compute.Metadata{Items: []*compute.MetadataItems{{Key: "cluster-name", Value: lo.ToPtr("cluster")}}},
 					}}}
 				}
 				_ = json.NewEncoder(w).Encode(&compute.InstanceAggregatedList{Items: items})

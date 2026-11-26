@@ -280,3 +280,77 @@ func TestSettersCopyInputMaps(t *testing.T) {
 	require.Equal(t, InstanceLabels{"i": "v"}, model.instanceLabels)
 	require.Equal(t, CustomMetadata{"c": "v"}, model.customMetadata)
 }
+
+func TestHasValue(t *testing.T) {
+	t.Parallel()
+
+	md := &compute.Metadata{Items: []*compute.MetadataItems{
+		nil,
+		{Key: "cluster-name", Value: lo.ToPtr("a-b.com")},
+		{Key: "empty-value"},
+	}}
+
+	require.False(t, HasValue(nil, "cluster-name", "a-b.com"))
+	require.True(t, HasValue(md, "cluster-name", "a-b.com"))
+	require.False(t, HasValue(md, "cluster-name", "a.b.com"))
+	require.True(t, HasValue(md, "empty-value", ""))
+	require.False(t, HasValue(md, "missing", ""))
+}
+
+func TestValidateComputeMetadataSize(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name            string
+		md              *compute.Metadata
+		wantErrContains []string
+	}{
+		{
+			name: "nil metadata is valid",
+			md:   nil,
+		},
+		{
+			name: "under limits",
+			md:   SelfHostedComputeMetadata("cluster", strings.Repeat("x", MaxMetadataValueBytes), nil),
+		},
+		{
+			name: "single value over limit",
+			md:   SelfHostedComputeMetadata("cluster", strings.Repeat("x", MaxMetadataValueBytes+1), nil),
+			wantErrContains: []string{
+				`metadata value for key "startup-script"`,
+				"per-value limit of 262144 bytes",
+			},
+		},
+		{
+			// Each value is at the per-value limit, so only the combined total trips.
+			name: "total over limit",
+			md: SelfHostedComputeMetadata("cluster", strings.Repeat("x", MaxMetadataValueBytes), CustomMetadata{
+				"user-payload": strings.Repeat("y", MaxMetadataValueBytes),
+			}),
+			wantErrContains: []string{"per-instance limit of 524288 bytes"},
+		},
+		{
+			// CRD maxLength counts characters: 70000 four-byte runes pass the
+			// 131072-char CEL limit on startupScript but total 280000 bytes, over
+			// GCE's 262144-byte limit.
+			name:            "multi-byte script under char limit over byte limit",
+			md:              SelfHostedComputeMetadata("cluster", strings.Repeat("\U0001F680", 70000), nil),
+			wantErrContains: []string{`metadata value for key "startup-script" is 280000 bytes`},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := ValidateComputeMetadataSize(tc.md)
+			if len(tc.wantErrContains) == 0 {
+				require.NoError(t, err)
+				return
+			}
+			for _, want := range tc.wantErrContains {
+				require.ErrorContains(t, err, want)
+			}
+		})
+	}
+}

@@ -70,16 +70,16 @@ func NewController(
 ) []controller.Controller {
 	controllers := []controller.Controller{
 		nodeclassstatus.NewController(kubeClient, imageProvider, gkeProvider, subnetProvider),
-		nodepooltemplate.NewController(nodePoolTemplateProvider),
 		nodeclasstermination.NewController(kubeClient),
 		nodeclasshash.NewController(kubeClient),
 		instancetype.NewController(instanceTypeProvider),
-		csr.NewController(kubernetesInterface),
 		controllerspricing.NewController(pricingProvider),
 		nodeclaimgc.NewController(kubeClient, cloudProvider),
 		gcecustommachinetype.NewController(kubeClient, authOptions, gkeProvider),
 		nodecreation.NewController(kubeClient, gkeProvider, recorder, options.FromContext(ctx).ProjectID),
 	}
+
+	controllers = append(controllers, gkeControllers(ctx, kubernetesInterface, nodePoolTemplateProvider)...)
 
 	if options.FromContext(ctx).Interruption {
 		controllers = append(controllers, interruption.NewController(
@@ -97,4 +97,21 @@ func NewController(
 	}
 
 	return controllers
+}
+
+// gkeControllers returns the GKE-only controllers: self-hosted clusters have no GKE
+// bootstrap templates to sync, and auto-approving kubelet CSRs would bypass the
+// distribution's own node authorization.
+func gkeControllers(
+	ctx context.Context,
+	kubernetesInterface kubernetes.Interface,
+	nodePoolTemplateProvider providernodepooltemplate.Provider,
+) []controller.Controller {
+	if options.FromContext(ctx).IsSelfHosted() {
+		return nil
+	}
+	return []controller.Controller{
+		nodepooltemplate.NewController(nodePoolTemplateProvider),
+		csr.NewController(kubernetesInterface),
+	}
 }

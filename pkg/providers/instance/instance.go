@@ -404,6 +404,9 @@ func (p *DefaultProvider) isInstanceExists(ctx context.Context, zone, instanceNa
 		}
 		return nil, false, fmt.Errorf("failed to get instance: %w", err)
 	}
+	if !p.ownsComputeInstance(instance) {
+		return nil, false, nil
+	}
 	return instance, true, nil
 }
 
@@ -419,6 +422,9 @@ func (p *DefaultProvider) findInstanceByNodeClaim(ctx context.Context, nodeClaim
 				continue
 			}
 			for _, i := range items.Instances {
+				if !p.ownsComputeInstance(i) {
+					continue
+				}
 				instance = i
 				return nil
 			}
@@ -429,6 +435,16 @@ func (p *DefaultProvider) findInstanceByNodeClaim(ctx context.Context, nodeClaim
 		return nil, err
 	}
 	return instance, nil
+}
+
+// ownsComputeInstance reports whether inst belongs to this cluster: its
+// cluster-name metadata must equal clusterName (when set) and any stamped
+// cluster-location label must match clusterLocation.
+func (p *DefaultProvider) ownsComputeInstance(inst *compute.Instance) bool {
+	if p.clusterName != "" && !metadata.HasValue(inst.Metadata, metadata.ClusterNameKey, p.clusterName) {
+		return false
+	}
+	return p.matchesClusterLocation(inst.Labels)
 }
 
 func lastPathSegment(value string) string {
@@ -577,7 +593,7 @@ func (p *DefaultProvider) createWithCapacityType(ctx context.Context, nodeClass 
 		// we could wait for the node to be present in kubernetes api via csr sign up
 		// should be done with watcher, for now implemented as a csr controller
 		log.FromContext(ctx).Info("Created instance", "instanceName", instance.Name, "instanceType", instanceType.Name,
-			"zone", zone, "projectID", p.projectID, "region", p.region, "providerID", instance.Name, "providerID", instance.Name,
+			"zone", zone, "projectID", p.projectID, "region", p.region, "providerID", instance.Name,
 			"Labels", instance.Labels, "Tags", instance.Tags, "Status", instance.Status)
 
 		created := &Instance{
@@ -624,16 +640,22 @@ func (p *DefaultProvider) tryCreateInstance(ctx context.Context, nodeClass *v1al
 		return nil, "", &retryableError{err}
 	}
 
-	sourceMetadata, err := p.nodePoolTemplateProvider.GetSourceTemplateMetadata(ctx)
-	if err != nil {
-		log.FromContext(ctx).Error(err, "failed to get source template metadata")
-		return nil, zone, &retryableError{err}
-	}
+	// Self-hosted mode has no bootstrap source pool and no GKE cluster config; bootstrap
+	// material comes from the NodeClass instead.
+	var sourceMetadata *compute.Metadata
+	var clusterConfig *container.Cluster
+	if !options.FromContext(ctx).IsSelfHosted() {
+		sourceMetadata, err = p.nodePoolTemplateProvider.GetSourceTemplateMetadata(ctx)
+		if err != nil {
+			log.FromContext(ctx).Error(err, "failed to get source template metadata")
+			return nil, zone, &retryableError{err}
+		}
 
-	clusterConfig, err := p.gkeProvider.GetClusterConfig(ctx)
-	if err != nil {
-		log.FromContext(ctx).Error(err, "failed to fetch cluster config")
-		return nil, zone, &retryableError{err}
+		clusterConfig, err = p.gkeProvider.GetClusterConfig(ctx)
+		if err != nil {
+			log.FromContext(ctx).Error(err, "failed to fetch cluster config")
+			return nil, zone, &retryableError{err}
+		}
 	}
 
 	instance, effectiveZone, retryable, err := p.getOrCreateInstance(ctx, nodeClaim, nodeClass, instanceType, sourceMetadata, clusterConfig, zone, capacityType, attemptedZones, mt, ssdCount, freeIPs)
@@ -1094,22 +1116,54 @@ func (p *DefaultProvider) buildInstance(ctx context.Context, nodeClaim *karpv1.N
 
 	isGPUInstance := instanceTypeHasGPU(instanceType)
 
-	// Setup metadata
-	instanceMetadata, err := p.setupInstanceMetadata(ctx, sourceMetadata, nodeClass, instanceType, nodeClaim, zone, capacityType, isGPUInstance, ssdCount, bootDiskSwap.SwapGiB, launch.Bootstrap)
-	if err != nil {
-		return nil, fmt.Errorf("setting up instance metadata: %w", err)
+	// In self-hosted mode NodeClass-sourced values replace GKE bootstrap metadata,
+	// tags, and labels; the image or startup script owns GPU driver setup.
+	selfHosted := options.FromContext(ctx).IsSelfHosted()
+
+	// Setup metadata, labels, network interfaces, and tags.
+	var computeMetadata *compute.Metadata
+	var instanceLabels map[string]string
+	var networkInterfaces []*compute.NetworkInterface
+	var instanceTags *compute.Tags
+	if selfHosted {
+		computeMetadata = metadata.SelfHostedComputeMetadata(
+			p.clusterName,
+			lo.FromPtr(nodeClass.Spec.StartupScript),
+			metadata.CustomMetadata(nodeClass.Spec.Metadata),
+		)
+		instanceLabels = initializeInstanceLabels(nodeClass)
+		networkInterfaces, err = p.setupSelfHostedNetworkInterfaces(nodeClass, podRange)
+		if err != nil {
+			return nil, fmt.Errorf("setting up network interfaces: %w", err)
+		}
+		// Only the NodeClass network tags: the gke-<cluster>-node firewall tags target
+		// GKE-created firewall rules that do not exist on a self-hosted cluster.
+		instanceTags = &compute.Tags{Items: lo.Uniq(lo.Map(nodeClass.Spec.NetworkTags, func(t v1alpha1.NetworkTag, _ int) string {
+			return string(t)
+		}))}
+	} else {
+		instanceMetadata, err := p.setupInstanceMetadata(ctx, sourceMetadata, nodeClass, instanceType, nodeClaim, zone, capacityType, isGPUInstance, ssdCount, bootDiskSwap.SwapGiB, launch.Bootstrap)
+		if err != nil {
+			return nil, fmt.Errorf("setting up instance metadata: %w", err)
+		}
+		patchGCFSDCacheSizeKubeEnv(instanceMetadata, int64(mt.GetMemoryMb()))
+		networkInterfaces, err = p.setupPodNetwork(clusterConfig, nodeClass, instanceMetadata, podRange)
+		if err != nil {
+			return nil, err
+		}
+		if err := p.configureDualStackNetwork(ctx, clusterConfig, networkInterfaces); err != nil {
+			return nil, fmt.Errorf("configuring dual-stack networking: %w", err)
+		}
+		computeMetadata, err = instanceMetadata.ToComputeMetadata()
+		if err != nil {
+			return nil, fmt.Errorf("rendering instance metadata: %w", err)
+		}
+		instanceLabels = instanceMetadata.ToComputeInstanceLabels()
+		setupGKEOwnedInstanceLabels(instanceLabels, clusterConfig.Id, capacityType)
+		instanceTags = buildInstanceTags(p.clusterName, clusterConfig.Id, nodeClass.Spec.NetworkTags)
 	}
-	patchGCFSDCacheSizeKubeEnv(instanceMetadata, int64(mt.GetMemoryMb()))
-	interfaces, err := p.setupPodNetwork(clusterConfig, nodeClass, instanceMetadata, podRange)
-	if err != nil {
-		return nil, err
-	}
-	if err := p.configureDualStackNetwork(ctx, clusterConfig, interfaces); err != nil {
-		return nil, fmt.Errorf("configuring dual-stack networking: %w", err)
-	}
-	computeMetadata, err := instanceMetadata.ToComputeMetadata()
-	if err != nil {
-		return nil, fmt.Errorf("rendering instance metadata: %w", err)
+	if err := metadata.ValidateComputeMetadataSize(computeMetadata); err != nil {
+		return nil, fmt.Errorf("GCENodeClass %s: %w", nodeClass.Name, err)
 	}
 
 	serviceAccounts, err := p.setupServiceAccounts(nodeClass)
@@ -1121,13 +1175,13 @@ func (p *DefaultProvider) buildInstance(ctx context.Context, nodeClaim *karpv1.N
 		Name:              instanceName,
 		MachineType:       fmt.Sprintf("zones/%s/machineTypes/%s", zone, instanceType.Name),
 		Disks:             attachedDisks,
-		NetworkInterfaces: interfaces,
+		NetworkInterfaces: networkInterfaces,
 		MinCpuPlatform:    nodeClass.Spec.MinCpuPlatform,
 		ServiceAccounts:   serviceAccounts,
 		Metadata:          computeMetadata,
-		Labels:            instanceMetadata.ToComputeInstanceLabels(),
+		Labels:            instanceLabels,
 		Scheduling:        setupScheduling(capacityType, nodeClass),
-		Tags:              buildInstanceTags(p.clusterName, clusterConfig.Id, nodeClass.Spec.NetworkTags),
+		Tags:              instanceTags,
 	}
 	if len(nodeClass.Spec.ResourceManagerTags) > 0 {
 		instance.Params = &compute.InstanceParams{
@@ -1151,7 +1205,7 @@ func (p *DefaultProvider) buildInstance(ctx context.Context, nodeClaim *karpv1.N
 	p.configureAdvancedMachineFeatures(instance, nodeClass)
 
 	// Setup karpenter built-in labels
-	p.setupInstanceLabels(instance, nodeClaim, nodeClass, clusterConfig.Id, ssdCount)
+	p.setupInstanceLabels(instance, nodeClaim, nodeClass, ssdCount)
 
 	return instance, nil
 }
@@ -1198,13 +1252,7 @@ func (p *DefaultProvider) setupNetworkInterfaces(cluster *container.Cluster, nod
 		}
 	}
 
-	var nic string
-	if nodeClass.Spec.GVNIC != nil {
-		nic = "VIRTIO_NET"
-		if nodeClass.Spec.GVNIC.Enabled {
-			nic = "GVNIC"
-		}
-	}
+	nic := networkInterfaceType(nodeClass)
 
 	primary := &compute.NetworkInterface{
 		Network:    network,
@@ -1224,6 +1272,16 @@ func (p *DefaultProvider) setupNetworkInterfaces(cluster *container.Cluster, nod
 	}
 
 	return ifaces
+}
+
+func networkInterfaceType(nodeClass *v1alpha1.GCENodeClass) string {
+	if nodeClass.Spec.GVNIC == nil {
+		return ""
+	}
+	if nodeClass.Spec.GVNIC.Enabled {
+		return "GVNIC"
+	}
+	return "VIRTIO_NET"
 }
 
 // applyAccessConfig sets the ONE_TO_ONE_NAT access config on iface when external is enabled,
@@ -1576,13 +1634,8 @@ func (p *DefaultProvider) configureInstanceCapacityProvision(instance *compute.I
 	if instance.Scheduling == nil {
 		instance.Scheduling = &compute.Scheduling{}
 	}
-	if instance.Labels == nil {
-		instance.Labels = map[string]string{}
-	}
-	instance.Labels["goog-gke-node-pool-provisioning-model"] = "on-demand"
 
 	if capacityType == karpv1.CapacityTypeSpot {
-		instance.Labels["goog-gke-node-pool-provisioning-model"] = "spot"
 		instance.Scheduling.ProvisioningModel = "SPOT"
 		instance.Scheduling.Preemptible = true
 		instance.Scheduling.AutomaticRestart = ptr.To(false)
@@ -1628,6 +1681,20 @@ func onHostMaintenancePolicy(instanceType *cloudprovider.InstanceType, capacityT
 	return "MIGRATE"
 }
 
+// setupGKEOwnedInstanceLabels writes the labels GKE stamps on managed nodes; only the
+// gke-mode launch path calls it, and the base32 cluster-id label needs a GKE cluster ID.
+func setupGKEOwnedInstanceLabels(labels map[string]string, clusterID, capacityType string) {
+	if id, ok := clusterIDBase32(clusterID); ok {
+		labels["goog-gke-cluster-id-base32"] = id
+	}
+	labels["goog-gke-cost-management"] = ""
+	labels["goog-gke-node"] = ""
+	labels["goog-gke-node-pool-provisioning-model"] = "on-demand"
+	if capacityType == karpv1.CapacityTypeSpot {
+		labels["goog-gke-node-pool-provisioning-model"] = "spot"
+	}
+}
+
 // configureConfidentialInstance applies the NodeClass ConfidentialInstanceType
 // to the GCE instance. When confidential compute is enabled, scheduling
 // onHostMaintenance is forced to TERMINATE since Confidential VMs cannot
@@ -1667,13 +1734,8 @@ func (p *DefaultProvider) configureAdvancedMachineFeatures(instance *compute.Ins
 // setupInstanceLabels writes controller-owned GCE labels for a new instance.
 // Kubernetes node labels are rebuilt separately in bootstrap metadata and must
 // not be copied to GCE instance labels.
-func (p *DefaultProvider) setupInstanceLabels(instance *compute.Instance, nodeClaim *karpv1.NodeClaim, nodeClass *v1alpha1.GCENodeClass, clusterID string, ssdCount int) {
+func (p *DefaultProvider) setupInstanceLabels(instance *compute.Instance, nodeClaim *karpv1.NodeClaim, nodeClass *v1alpha1.GCENodeClass, ssdCount int) {
 	maps.Copy(instance.Labels, p.karpenterGCEIdentityLabels(nodeClaim, nodeClass))
-	if id, ok := clusterIDBase32(clusterID); ok {
-		instance.Labels["goog-gke-cluster-id-base32"] = id
-	}
-	instance.Labels["goog-gke-cost-management"] = ""
-	instance.Labels["goog-gke-node"] = ""
 	// Do not set goog-k8s-node-pool-name. That is GKE-managed node pool identity;
 	// Karpenter ownership is tracked with karpenter.sh/nodepool instead.
 	instance.Labels[utils.SanitizeGCELabelValue(v1alpha1.LabelInstanceLocalSsdCount)] = strconv.Itoa(ssdCount)
@@ -1684,11 +1746,13 @@ func (p *DefaultProvider) setupInstanceLabels(instance *compute.Instance, nodeCl
 // so use the same normalized keys as the instance label representation.
 // LabelClusterNameKey is used by the syncInstances API filter; LabelClusterLocationKey
 // is checked by belongsToCluster to distinguish same-named clusters in different locations.
+// Cluster name is sanitized unconditionally: a no-op for label-safe GKE names, required for
+// self-hosted FQDNs. The exact name lives only in the cluster-name metadata key.
 func (p *DefaultProvider) karpenterGCEIdentityLabels(nodeClaim *karpv1.NodeClaim, nodeClass *v1alpha1.GCENodeClass) map[string]string {
 	return map[string]string{
 		utils.SanitizeGCELabelValue(utils.LabelNodePoolKey):     nodeClaim.Labels[karpv1.NodePoolLabelKey],
 		utils.SanitizeGCELabelValue(utils.LabelGCENodeClassKey): nodeClass.Name,
-		utils.LabelClusterNameKey:                               p.clusterName,
+		utils.LabelClusterNameKey:                               utils.SanitizeGCELabelValue(p.clusterName),
 		utils.LabelClusterLocationKey:                           p.clusterLocation,
 	}
 }
@@ -1705,8 +1769,9 @@ func clusterIDBase32(clusterID string) (string, bool) {
 // cache. An instance with goog-k8s-cluster-location present must match this cluster's
 // location. An instance without the label (created by an older Karpenter version) is
 // treated as ours for backward compatibility — the GC controller separately skips
-// label-less instances to prevent cross-cluster deletion. Cluster-name is enforced by the
-// GCE API label filter in syncInstances.
+// label-less instances to prevent cross-cluster deletion. Cluster-name is enforced in
+// syncInstances: the sanitized label is only a coarse server-side filter, and admission
+// requires an exact cluster-name metadata match.
 //
 // TODO: once all instances carry goog-k8s-cluster-location (i.e. after all clusters have
 // been upgraded past this release and all pre-existing nodes have been rotated), replace
@@ -1714,7 +1779,11 @@ func clusterIDBase32(clusterID string) (string, bool) {
 // label as a server-side filter in syncInstances. Until then the fallback must stay to
 // avoid making pre-label instances invisible to Karpenter.
 func (p *DefaultProvider) belongsToCluster(inst *Instance) bool {
-	loc, ok := inst.Labels[utils.SanitizeGCELabelValue(utils.LabelClusterLocationKey)]
+	return p.matchesClusterLocation(inst.Labels)
+}
+
+func (p *DefaultProvider) matchesClusterLocation(labels map[string]string) bool {
+	loc, ok := labels[utils.SanitizeGCELabelValue(utils.LabelClusterLocationKey)]
 	return !ok || loc == p.clusterLocation
 }
 
@@ -1922,7 +1991,7 @@ func (p *DefaultProvider) syncInstances(ctx context.Context) error {
 		utils.SanitizeGCELabelValue(utils.LabelNodePoolKey),
 		utils.SanitizeGCELabelValue(utils.LabelGCENodeClassKey),
 		utils.SanitizeGCELabelValue(utils.LabelClusterNameKey),
-		p.clusterName,
+		utils.SanitizeGCELabelValue(p.clusterName),
 	)
 
 	zones, err := p.getZonesInRegion(ctx)
@@ -1939,6 +2008,13 @@ func (p *DefaultProvider) syncInstances(ctx context.Context) error {
 			}
 
 			for _, inst := range page.Items {
+				// Label sanitization is lossy (a.b.com and a-b.com collide), so the filter
+				// above is only coarse: admit an instance only when its cluster-name
+				// metadata equals this cluster's exact name — inherited from the source
+				// template in gke mode, set from CLUSTER_NAME in self-hosted.
+				if !metadata.HasValue(inst.Metadata, metadata.ClusterNameKey, p.clusterName) {
+					continue
+				}
 				instance := &Instance{
 					InstanceID:   inst.Name,
 					Name:         inst.Name,

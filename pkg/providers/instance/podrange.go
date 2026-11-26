@@ -31,6 +31,7 @@ import (
 
 	"github.com/karpenter-gcp/karpenter-provider-gcp/pkg/apis/v1alpha1"
 	"github.com/karpenter-gcp/karpenter-provider-gcp/pkg/metadata"
+	"github.com/karpenter-gcp/karpenter-provider-gcp/pkg/operator/options"
 	"github.com/karpenter-gcp/karpenter-provider-gcp/pkg/providers/gke"
 	"github.com/karpenter-gcp/karpenter-provider-gcp/pkg/providers/subnet"
 )
@@ -162,10 +163,14 @@ func (p *DefaultProvider) invalidatePodRangeCaches(instance *compute.Instance, d
 }
 
 func (p *DefaultProvider) podRangeFreeIPs(ctx context.Context, nodeClass *v1alpha1.GCENodeClass) map[string]int64 {
-	cluster, err := p.gkeProvider.GetClusterConfig(ctx)
-	if err != nil {
-		log.FromContext(ctx).Error(err, "getting cluster config for pod range capacity")
-		return nil
+	var cluster *containerv1.Cluster
+	if !options.FromContext(ctx).IsSelfHosted() {
+		var err error
+		cluster, err = p.gkeProvider.GetClusterConfig(ctx)
+		if err != nil {
+			log.FromContext(ctx).Error(err, "getting cluster config for pod range capacity")
+			return nil
+		}
 	}
 	names := resolvedPodRangeNames(nodeClass, cluster)
 	if len(names) < 2 {

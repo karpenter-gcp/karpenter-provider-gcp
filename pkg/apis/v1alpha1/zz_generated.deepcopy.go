@@ -386,6 +386,11 @@ func (in *GCENodeClassSpec) DeepCopyInto(out *GCENodeClassSpec) {
 		*out = new(NetworkConfig)
 		(*in).DeepCopyInto(*out)
 	}
+	if in.StartupScript != nil {
+		in, out := &in.StartupScript, &out.StartupScript
+		*out = new(string)
+		**out = **in
+	}
 	if in.GPUSharingConfig != nil {
 		in, out := &in.GPUSharingConfig, &out.GPUSharingConfig
 		*out = new(GPUSharingConfig)

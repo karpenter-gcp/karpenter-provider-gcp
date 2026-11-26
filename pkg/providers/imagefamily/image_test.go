@@ -31,6 +31,7 @@ import (
 	containerv1 "google.golang.org/api/container/v1"
 
 	"github.com/karpenter-gcp/karpenter-provider-gcp/pkg/apis/v1alpha1"
+	"github.com/karpenter-gcp/karpenter-provider-gcp/pkg/operator/options"
 )
 
 // stubGKEProvider satisfies gke.Provider for unit tests.
@@ -45,6 +46,29 @@ func (s *stubGKEProvider) GetClusterConfig(_ context.Context) (*containerv1.Clus
 }
 func (s *stubGKEProvider) GetServerConfig(_ context.Context) (*containerv1.ServerConfig, error) {
 	return s.serverConfig, nil
+}
+
+// failingGKEProvider satisfies gke.Provider and fails the test on any call — used to
+// prove a code path never reaches the GKE provider.
+type failingGKEProvider struct{ t *testing.T }
+
+func (f *failingGKEProvider) ResolveClusterZones(_ context.Context) ([]string, error) {
+	f.t.Error("ResolveClusterZones must not be called")
+	return nil, nil
+}
+
+func (f *failingGKEProvider) GetClusterConfig(_ context.Context) (*containerv1.Cluster, error) {
+	f.t.Error("GetClusterConfig must not be called")
+	return nil, nil
+}
+
+func (f *failingGKEProvider) InvalidateClusterConfig() {
+	f.t.Error("InvalidateClusterConfig must not be called")
+}
+
+func (f *failingGKEProvider) GetServerConfig(_ context.Context) (*containerv1.ServerConfig, error) {
+	f.t.Error("GetServerConfig must not be called")
+	return nil, nil
 }
 
 func readyTestImages(images []*compute.Image) []*compute.Image {
@@ -364,6 +388,152 @@ func TestCOSExactSelectorsWithoutUsableImagesAreUnavailable(t *testing.T) {
 			images, err := p.List(context.Background(), nc)
 			require.True(t, IsImageUnavailableError(err), "expected publication unavailability, got %v", err)
 			require.Empty(t, images)
+		})
+	}
+}
+
+func selfHostedImageContext() context.Context {
+	return options.ToContext(context.Background(), &options.Options{
+		ProvisionMode: options.ProvisionModeSelfHosted,
+	})
+}
+
+func TestList_SelfHostedRejectsNonIDTerms(t *testing.T) {
+	testCases := []struct {
+		name string
+		term v1alpha1.ImageSelectorTerm
+	}{
+		{name: "alias term", term: v1alpha1.ImageSelectorTerm{Alias: "ContainerOptimizedOS@latest"}}, //nolint:staticcheck // Verify deprecated alias terms are also rejected in self-hosted mode.
+		{name: "family with version", term: v1alpha1.ImageSelectorTerm{Family: v1alpha1.ImageFamilyContainerOptimizedOS, Version: "latest"}},
+		{name: "family with channel", term: v1alpha1.ImageSelectorTerm{Family: v1alpha1.ImageFamilyContainerOptimizedOS, Channel: v1alpha1.ImageChannelStable}},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := NewDefaultProvider(nil, &fakeVersionProvider{version: "v1.34.7"}, &failingGKEProvider{t: t})
+			nc := &v1alpha1.GCENodeClass{Spec: v1alpha1.GCENodeClassSpec{
+				ImageSelectorTerms: []v1alpha1.ImageSelectorTerm{tc.term},
+			}}
+
+			_, err := p.List(selfHostedImageContext(), nc)
+			require.Error(t, err)
+			require.True(t, IsImageResolutionError(err), "expected a terminal image resolution error")
+			require.Contains(t, err.Error(), "only id: imageSelectorTerms are supported in self-hosted mode")
+		})
+	}
+}
+
+func TestList_SelfHostedResolvesIDWithoutVersionOrGKECalls(t *testing.T) {
+	catalog := &imageCatalog{
+		pages: [][]*compute.Image{{
+			{Name: "custom-kops-image", Architecture: OSArchitectureX86, Status: "READY"},
+		}},
+	}
+	srv := imageCatalogServer(t, catalog)
+	t.Cleanup(srv.Close)
+
+	// Both versionProvider (nil) and gkeProvider (failing) must remain untouched.
+	p := NewDefaultProvider(buildComputeService(t, srv), nil, &failingGKEProvider{t: t})
+	nc := &v1alpha1.GCENodeClass{Spec: v1alpha1.GCENodeClassSpec{
+		ImageSelectorTerms: []v1alpha1.ImageSelectorTerm{
+			{ID: "projects/my-project/global/images/custom-kops-image"},
+		},
+	}}
+
+	imgs, err := p.List(selfHostedImageContext(), nc)
+	require.NoError(t, err)
+	require.Len(t, imgs, 1)
+	require.Equal(t, "projects/my-project/global/images/custom-kops-image", imgs[0].SourceImage)
+	require.Empty(t, imgs[0].KubernetesVersion)
+	require.Equal(t, OSArchAMD64Requirement, imgs[0].Requirements.Get("kubernetes.io/arch").Any())
+}
+
+func TestList_SelfHostedCanonicalizesFullImageURLs(t *testing.T) {
+	catalog := &imageCatalog{
+		pages: [][]*compute.Image{{
+			{Name: "amd64-image", Architecture: OSArchitectureX86, Status: "READY"},
+			{Name: "arm64-image", Architecture: OSArchitectureARM, Status: "READY"},
+			{Name: "unspecified-arch-image", Architecture: "ARCHITECTURE_UNSPECIFIED", Status: "READY"},
+		}},
+	}
+	srv := imageCatalogServer(t, catalog)
+	t.Cleanup(srv.Close)
+
+	p := NewDefaultProvider(buildComputeService(t, srv), nil, &failingGKEProvider{t: t})
+	nc := &v1alpha1.GCENodeClass{Spec: v1alpha1.GCENodeClassSpec{
+		ImageSelectorTerms: []v1alpha1.ImageSelectorTerm{
+			{ID: "https://www.googleapis.com/compute/v1/projects/my-project/global/images/amd64-image"},
+			{ID: "https://compute.googleapis.com/compute/v1/projects/my-project/global/images/arm64-image"},
+		},
+	}}
+
+	imgs, err := p.List(selfHostedImageContext(), nc)
+	require.NoError(t, err)
+	require.Equal(t, []string{
+		"projects/my-project/global/images/amd64-image",
+		"projects/my-project/global/images/arm64-image",
+	}, imageSources(imgs), "full image URLs must be canonicalized to project-relative paths to prevent false ImageDrift")
+	require.Equal(t, OSArchAMD64Requirement, imgs[0].Requirements.Get("kubernetes.io/arch").Any())
+	require.Equal(t, OSArchARM64Requirement, imgs[1].Requirements.Get("kubernetes.io/arch").Any())
+
+	// Images without an explicit GCE architecture must be rejected rather than guessed as amd64.
+	unsetArchNC := &v1alpha1.GCENodeClass{Spec: v1alpha1.GCENodeClassSpec{
+		ImageSelectorTerms: []v1alpha1.ImageSelectorTerm{
+			{ID: "projects/my-project/global/images/unspecified-arch-image"},
+		},
+	}}
+	_, err = p.List(selfHostedImageContext(), unsetArchNC)
+	require.ErrorContains(t, err, `unsupported architecture "ARCHITECTURE_UNSPECIFIED"`)
+}
+
+func TestParseImageSource(t *testing.T) {
+	testCases := []struct {
+		name        string
+		input       string
+		wantProject string
+		wantImage   string
+		wantErr     bool
+	}{
+		{
+			name:        "project-relative path",
+			input:       "projects/my-proj/global/images/img-1",
+			wantProject: "my-proj",
+			wantImage:   "img-1",
+		},
+		{
+			name:        "www.googleapis.com full URL",
+			input:       "https://www.googleapis.com/compute/v1/projects/my-proj/global/images/img-1",
+			wantProject: "my-proj",
+			wantImage:   "img-1",
+		},
+		{
+			name:        "compute.googleapis.com full URL with surrounding whitespace",
+			input:       "  https://compute.googleapis.com/compute/v1/projects/my-proj/global/images/img-1  ",
+			wantProject: "my-proj",
+			wantImage:   "img-1",
+		},
+		{
+			name:    "global path without project rejected",
+			input:   "global/images/img-1",
+			wantErr: true,
+		},
+		{
+			name:    "bare image name rejected",
+			input:   "img-1",
+			wantErr: true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			project, image, err := parseImageSource(tc.input)
+			if tc.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tc.wantProject, project)
+			require.Equal(t, tc.wantImage, image)
 		})
 	}
 }

@@ -49,9 +49,16 @@ import (
 
 // DefaultGrace is how long after enrollment a claim may stay without a Node before
 // the controller re-reads the cluster's node creation mode. The cached mode can
-// lag a mode change by the cluster-config cache TTL; in observed runs the kubelet
-// registered about a second after its certificate was issued.
-const DefaultGrace = 45 * time.Second
+// lag a mode change by the cluster-config cache TTL (30 minutes), so the re-read is
+// what lets a claim launched after a switch to VIA_CONTROL_PLANE get its Node.
+//
+// Five minutes sits between two bounds. Below it, the kubelet registers about a
+// second after its certificate and a Node is Ready within about a minute of
+// the claim's launch, so any delay past a minute never races a healthy kubelet.
+// Above it, core deletes a NodeClaim that has not registered 15 minutes after its
+// creation, and enrollment takes about 1.5 minutes from creation: re-reading at
+// five minutes still leaves roughly 8 minutes to create the Node and register.
+const DefaultGrace = 5 * time.Minute
 
 // maxNodeLabelsBytes bounds the node-labels annotation the controller parses. The
 // set the provider writes is about 1 KB; the bound only limits a hostile edit.

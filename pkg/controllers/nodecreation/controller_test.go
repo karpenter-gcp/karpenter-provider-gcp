@@ -264,7 +264,7 @@ func TestReconcileModeGate(t *testing.T) {
 		},
 		{
 			name: "kubelet mode waits out the grace period", mode: gke.NodeCreationModeKubelet,
-			enrolledAgo: 10 * time.Second, wantRequeue: 35 * time.Second,
+			enrolledAgo: 10 * time.Second, wantRequeue: DefaultGrace - 10*time.Second,
 		},
 		{
 			name: "kubelet mode never creates, even for an overdue claim", mode: gke.NodeCreationModeKubelet,
@@ -272,7 +272,7 @@ func TestReconcileModeGate(t *testing.T) {
 		},
 		{
 			name: "mode change seen on forced re-read creates", mode: gke.NodeCreationModeKubelet,
-			afterRefresh: gke.NodeCreationModeControlPlane, enrolledAgo: 46 * time.Second, wantNode: true, wantRefreshes: 1, wantEventReason: []string{reasonNodeCreated},
+			afterRefresh: gke.NodeCreationModeControlPlane, enrolledAgo: DefaultGrace + time.Second, wantNode: true, wantRefreshes: 1, wantEventReason: []string{reasonNodeCreated},
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {

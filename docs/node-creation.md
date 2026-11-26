@@ -31,7 +31,7 @@ Karpenter waits for enrollment instead of creating the `Node` at launch, so that
 
 There is no setting. Karpenter creates the `Node` only when the GKE cluster reports `nodeCreationConfig.nodeCreationMode = VIA_CONTROL_PLANE`. On a `VIA_KUBELET` cluster it never creates a `Node`, and nothing changes from earlier versions.
 
-The cluster's mode is cached for up to 30 minutes, so a switch to `VIA_CONTROL_PLANE` is not seen immediately. When an enrolled NodeClaim still has no `Node` after 45 seconds, Karpenter re-reads the mode once for that claim and creates the `Node` if the cluster now reports `VIA_CONTROL_PLANE`. The wait is a refresh delay, not a fallback: on a `VIA_KUBELET` cluster the claim keeps waiting for its kubelet.
+The cluster's mode is cached for up to 30 minutes, so a switch to `VIA_CONTROL_PLANE` is not seen immediately. When an enrolled NodeClaim still has no `Node` 5 minutes after enrollment, Karpenter re-reads the mode once for that claim and creates the `Node` if the cluster now reports `VIA_CONTROL_PLANE`. The wait is a refresh delay, not a fallback: on a `VIA_KUBELET` cluster the claim keeps waiting for its kubelet.
 
 ## Lifecycle and deletion
 

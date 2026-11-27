@@ -28,7 +28,7 @@ Key capabilities:
 
 ## Known limitations
 
-- **GKE Standard mode only** — GKE Autopilot manages its own node pools and does not allow external node provisioners.
+- **GKE Standard or self-hosted clusters only** — GKE Autopilot manages its own node pools and does not allow external node provisioners. Clusters on Compute Engine without GKE, such as kOps clusters, use [self-hosted mode](self-hosted.md).
 - **Linux nodes only** — Container-Optimized OS and Ubuntu are supported. Windows nodes are not.
 - **Kubernetes 1.28+** — earlier versions are not tested or supported.
 - **VPC-native (alias IP) networking required** — legacy routes-based networking is untested.
@@ -48,6 +48,7 @@ Key capabilities:
 - [Spot preemption notice](spot-preemption.md) — get up to two minutes' warning before GCE reclaims a Spot VM
 - [Static capacity](examples/static-capacity.md) — keep a fixed number of nodes running with `spec.replicas`
 - [Image management](image-management.md) — controlling GKE node image selection, version pinning, and drift
+- [Self-hosted clusters](self-hosted.md) — provision nodes for clusters on Compute Engine without GKE, such as kOps
 - [Running alongside GKE autoscaling](gke-autoscaling.md) — share a cluster with the GKE cluster autoscaler, node auto-provisioning, and ComputeClasses
 
 ## Reference

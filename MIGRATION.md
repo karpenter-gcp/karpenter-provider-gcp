@@ -53,6 +53,32 @@ imageSelectorTerms:
 
 GKE publishes each Ubuntu release only for some minors, and Karpenter never substitutes another (November 2026: 22.04 through 1.31, 24.04 for 1.31–1.37, 26.04 for 1.37 and 1.38 alpha). A NodeClass whose release has no image for the cluster's minor reports `ImagesReady=False` / `ImageResolutionFailed`; change `osVersion` (nodes then drift) before upgrading the cluster. See [OS families](docs/image-selection.md#os-families).
 
+### Kubelet CSR approval now requires TPM attestation bound to the launched VM
+
+The `kubelet-nodepool-bootstrap` and `kubelet-bootstrap` identities must present the native GKE TPM attestation proof, checked against the live Compute VM and the numeric instance ID recorded on the NodeClaim. There is no switch to skip it. See the [CSR approval contract](docs/security/csr-approval.md).
+
+**Before upgrading:**
+
+- Update the controller's custom role from [`deploy/iam/karpenter-controller-role.yaml`](deploy/iam/karpenter-controller-role.yaml) (`gcloud iam roles update`) to add `compute.instances.getShieldedInstanceIdentity`. The chart adds `create` on `subjectaccessreviews` itself.
+- Run the controller in the cluster's own project (it reads the project number from its node's metadata server).
+- Keep the vTPM enabled on nodes (the Compute Engine default; `enableVtpm: false` cannot enroll).
+- To pilot first, add a NodePool budget with `nodes: "0"` and `reasons: [Drifted]` before upgrading.
+
+**Existing nodes are replaced.** New VMs carry a NodeClaim UID label and the claim records the VM ID in `karpenter.k8s.gcp/instance-numeric-id`. Earlier claims and VMs have neither, so they cannot use attested enrollment, and an unlabelled VM is no longer adopted by a new claim (`InstanceIncarnationUnknown`). `system:node:<name>` self-renewal is unchanged and is the only renewal path for such claims. Do not backfill the annotation: it stops a same-named replacement VM from inheriting an identity.
+
+Launched, registered NodeClaims without a valid ID report drift `InstanceIncarnationDrift`, and dynamic and static NodePools replace them through normal disruption. An earlier core reason (for example `NodePoolDrifted`) can take precedence, so count affected nodes by their `Drifted` condition.
+
+- Verify enrollment of a new node under the new controller in a pilot before releasing fleet-wide drift; the default `10%` budget allows replacement as soon as the new controller reconciles.
+- Existing budgets, capacity checks, node-level `do-not-disrupt` and `terminationGracePeriod` semantics apply; there is no bypass.
+- A static pool at `limits.nodes` may delete first and refill if `TerminateFirstDrift` is enabled, so capacity dips and missing prerequisites would leave it short. Without the gate such nodes stay blocked.
+- Replacement before certificate expiry is not guaranteed. Downgrading clears the drift reason but does not migrate claims.
+
+> **Temporary bridge:** incarnation drift is planned for removal after v0.10, once upgrades from pre-incarnation versions must first roll their nodes through v0.10. It is not an automatic version cutoff.
+
+**With Shielded GKE Nodes disabled**, nodes enroll as requester `kubelet` without a proof. The controller approves this only for initial enrollment of one launched, unregistered claim whose live VM matches the recorded ID and UID label, and only while a fresh read of the cluster setting (existing `container.clusters.get`) says disabled. This is weaker: the VM association does not prove who sent the request, and a holder of the shared credential can request another pending claim. Enabling Shielded GKE Nodes stops it.
+
+**Validated** on one profile (Shielded GKE 1.36.4, COS/amd64, one dynamic NodePool): upgrading from v0.8.3 marks the old node drifted, a `nodes: "0"` budget holds the replacement back, and once relaxed the replacement enrolls with an attested CSR. **Not validated:** the legacy path on real GKE, static pools, certificate rotation, drain-time re-enrollment, other images, architectures and GKE versions. See [Proposal 0015](proposals/0015-gce-instance-bound-csr-approval.md).
+
 ### Release distribution moves to GHCR OCI
 
 Controller images use `ghcr.io/karpenter-gcp/karpenter-provider-gcp:vX.Y.Z`. Helm charts use `oci://ghcr.io/karpenter-gcp/karpenter-provider-gcp/charts/karpenter` and `/karpenter-crd` with version `X.Y.Z`. Use Helm 3.8+ or Helm 4; replace indexed chart references in Helm automation and allow GHCR image pulls in registry policies. Keep existing release names, namespaces and configured values; upgrade CRDs before the controller. A pinned `controller.image.repository` still overrides the new default and must be updated explicitly.
